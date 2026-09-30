@@ -3,25 +3,33 @@
 # uua — Universal Update All
 #
 # Updates APT packages, Node.js (through nvm), npm, Bun, the global
-# npm/bun packages and a set of AI coding CLIs in one run:
+# npm/bun packages and a set of AI coding CLIs in one run. Every step is
+# a job that starts the moment the jobs it builds on have finished, so
+# everything that can run at the same time does:
 #
-#   apt → node → npm → bun → npm -g → bun -g
-#                                        ↓
-#          ┌────────────┬─────────┬──────┴───────────────┐
-#          ↓            ↓         ↓                      ↓
-#       claude        codex   opencode                  pi
+#   apt ─────────────────────────→ AI CLIs installed by apt
+#   node ─→ npm ─→ npm -g
+#               └────────────────→ AI CLIs installed by npm
+#   bun ──→ bun -g (after node too)
+#       └────────────────────────→ AI CLIs installed by bun
+#   AI CLIs with installers of their own, from the start
 #
-# The core steps run in order, each building on the one before; the AI
-# CLIs are independent of each other and update in parallel. `uua --help`
-# is the reference for the options, what gets removed, and exit status.
+# The registry and release queries all go out first, while the sudo
+# password is typed. On a terminal a live board shows every job, what it
+# is doing and how far it has got. `uua --help` is the reference for the
+# options, what gets removed, and exit status.
 
 UUA_VERSION="0.1.0"
 
 autoload -Uz is-at-least
 zmodload zsh/datetime
+zmodload zsh/mathfunc
+zmodload zsh/parameter
+zmodload zsh/system
+zmodload -F zsh/stat b:zstat
 
-# Spinner ticks sleep through zselect when it is available, rather than
-# forking a sleep process a dozen times a second.
+# Ticks sleep through zselect when it is available, rather than forking
+# a sleep process a dozen times a second.
 _UUA_ZSELECT=0
 zmodload zsh/zselect 2>/dev/null && _UUA_ZSELECT=1
 
@@ -57,16 +65,24 @@ _UUA_RUN_DIR=""
 _UUA_RUN_LOCK="$_UUA_LOG_ROOT/lock"
 _UUA_HAVE_RUN_LOCK=0
 _UUA_NPM_ROOT=""
+_UUA_ACTIVE_NODE=""
 _UUA_SUDO_REFRESH_PID=""
 _UUA_CHILD_PIDS=()
 _UUA_FOLLOW=()
 _UUA_INTERRUPTED=0
 _UUA_CLEANED=0
 
+# Where the jobs report (see "Reporting from a job"), where prefetched
+# answers wait, and the --verbose stream every job's output goes to.
+_UUA_JOB=""
+_UUA_JOB_DIR=""
+_UUA_CACHE=""
+_UUA_STREAM=""
+
 # Time limits in seconds: one registry or release query, one install,
-# and one AI CLI worker from start to finish, so a stalled download
-# cannot hang an unattended run. APT has none: dpkg must not be killed
-# halfway through, and apt has network timeouts of its own.
+# and one AI CLI job from start to finish, so a stalled download cannot
+# hang an unattended run. APT has none: dpkg must not be killed halfway
+# through, and apt has network timeouts of its own.
 _UUA_QUERY_LIMIT=60
 _UUA_INSTALL_LIMIT=900
 _UUA_WORKER_LIMIT=1200
@@ -78,37 +94,128 @@ _UUA_VER_RE='[0-9]+(\.[0-9]+){1,3}([+-][0-9A-Za-z.-]+)?'
 # Colors and output
 # ─────────────────────────────────────────────────────────────
 
+# The board's colors per group, for its label and progress bars, plus
+# the whole run's bar, failure, and the faint track the bars fill.
+typeset -gA _UUA_GC
+
+
 _init_colors() {
   if [[ -t 1 && -z "${NO_COLOR:-}" ]] && (( ! _UUA_NO_COLOR )); then
     C_RESET=$'\033[0m' C_BOLD=$'\033[1m' C_DIM=$'\033[2m'
     C_RED=$'\033[91m' C_GREEN=$'\033[92m' C_YELLOW=$'\033[93m'
     C_BLUE=$'\033[94m' C_MAGENTA=$'\033[95m' C_CYAN=$'\033[96m'
+
+    if [[ "$TERM" == *256color* || -n "${COLORTERM:-}" ]]; then
+      _UUA_GC=(
+        total  $'\033[38;5;45m'   system $'\033[38;5;214m'
+        node   $'\033[38;5;77m'   bun    $'\033[38;5;211m'
+        ai     $'\033[38;5;141m'  failed $'\033[38;5;203m'
+        track  $'\033[38;5;240m'
+      )
+    else
+      _UUA_GC=(
+        total  $'\033[96m'  system $'\033[93m'  node  $'\033[92m'
+        bun    $'\033[95m'  ai     $'\033[94m'  failed $'\033[91m'
+        track  $'\033[90m'
+      )
+    fi
   else
     C_RESET="" C_BOLD="" C_DIM=""
     C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_MAGENTA="" C_CYAN=""
+    _UUA_GC=()
   fi
 }
 
 
-_section() {
-  printf '\n%s==>%s %s%s%s\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$1" "$C_RESET"
+# The mark for each state a row or a sub-line can be in.
+typeset -gA _UUA_ICON=(
+  ok        ✓
+  updated   ↑
+  available ↑
+  failed    ✗
+  absent    –
+  warn      ⚠
+  info      →
+  note      ·
+  tail      │
+  wait      ◌
+)
+
+
+_state_color() {
+  case "$1" in
+    ok)             REPLY=$C_GREEN ;;
+    updated)        REPLY=$C_CYAN ;;
+    available|warn) REPLY=$C_YELLOW ;;
+    failed)         REPLY=$C_RED ;;
+    info)           REPLY=$C_BLUE ;;
+    run)            REPLY=$C_MAGENTA ;;
+    *)              REPLY=$C_DIM ;;
+  esac
 }
 
 
+# "mark  text" for state $1, into REPLY: how a finished job prints when
+# there is no board, and how sub-lines print under a row.
+_fmt_line() {
+  _state_color "$1"
+
+  case "$1" in
+    absent|note|tail) REPLY="$C_DIM$_UUA_ICON[$1] $2$C_RESET" ;;
+    *)                REPLY="$REPLY$_UUA_ICON[$1]$C_RESET $2" ;;
+  esac
+}
+
+
+# Lines the main shell prints outside the board.
 _line()   { printf '%s%s%s  %s\n' "$1" "$2" "$C_RESET" "$3" }
-_ok()     { _line "$C_GREEN" "✓" "$1" }
-_update() { _line "$C_YELLOW" "↑" "$1" }
 _warn()   { _line "$C_YELLOW" "⚠" "$1" }
 _fail()   { _line "$C_RED" "✗" "$1" }
 _info()   { _line "$C_BLUE" "→" "$1" }
 
-# Something uua would handle but that is not installed here: listed so
-# the run shows what it covered, but not counted in the summary.
-_absent() { printf '%s-  %s%s\n' "$C_DIM" "$1" "$C_RESET" }
+
+# Outcome buckets for the summary.
+_mark_uptodate()  { (( ++_UUA_UPTODATE )) }
+_mark_updated()   { (( ++_UUA_UPDATED )) }
+_mark_available() { (( ++_UUA_AVAILABLE )) }
+_mark_failed()    { (( ++_UUA_FAILED_STEPS )) }
 
 
-_show_log_tail() {
-  local f
+# ─────────────────────────────────────────────────────────────
+# Reporting from a job
+# ─────────────────────────────────────────────────────────────
+#
+# A job runs in a subshell of its own, so it reports through files in
+# _UUA_JOB_DIR that the board reads: its row (one state and text; the
+# last one wins), the sub-lines printed under the row once it is done,
+# and what it is doing right now. Called outside a job, as the tests do,
+# they print instead.
+
+_row() {
+  if [[ -z "$_UUA_JOB" ]]; then
+    _fmt_line "$1" "$2"
+    print -r -- "$REPLY"
+    return 0
+  fi
+
+  print -r -- "$1|$2" >|"$_UUA_JOB_DIR/$_UUA_JOB.row"
+}
+
+
+_sub() {
+  if [[ -z "$_UUA_JOB" ]]; then
+    _fmt_line "$1" "$2"
+    print -r -- "   $REPLY"
+    return 0
+  fi
+
+  print -r -- "$1|$2" >>"$_UUA_JOB_DIR/$_UUA_JOB.sub"
+}
+
+
+# The last lines of log $1 and of $1.err, under the row.
+_sub_tail() {
+  local f line
 
   # --verbose has already shown all of it.
   (( _UUA_VERBOSE )) && return 0
@@ -116,24 +223,57 @@ _show_log_tail() {
   for f in "$1" "$1.err"; do
     [[ -s "$f" ]] || continue
 
-    printf '%s' "$C_DIM"
-    tail -n 8 "$f" | sed 's/^/   /'
-    printf '%s' "$C_RESET"
+    for line in "${(@f)$(tail -n 8 -- "$f")}"; do
+      _sub tail "$line"
+    done
   done
 }
 
 
-# Outcome buckets for the per-item status lines and the summary.
-_mark_uptodate()  { (( ++_UUA_UPTODATE )) }
-_mark_updated()   { (( ++_UUA_UPDATED )) }
-_mark_available() { (( ++_UUA_AVAILABLE )) }
-_mark_failed()    { (( ++_UUA_FAILED_STEPS )) }
+# The share of the job's progress bar its next activities cover: from
+# $1 to $2 (0 to 1), eased in over time with a time constant of $3
+# seconds (default 3), or, given $4 and $5, counted as the lines of the
+# activity's log that start with $4, out of $5. A percentage the command
+# prints counts too. The board never lets a bar shrink.
+_UUA_PHASE=()
+
+_phase() {
+  _UUA_PHASE=("$1" "$2" "${3:-3}" "${4:-}" "${5:-0}")
+}
+
+
+# What the job is doing now ($1), and the log its progress shows up in
+# ($2): the board shows the log's latest line beside it. The current
+# _phase goes along.
+_activity() {
+  [[ -n "$_UUA_JOB" ]] || return 0
+
+  print -r -- "$1"$'\t'"${2:-}"$'\t'"${(pj:\t:)_UUA_PHASE}" >|"$_UUA_JOB_DIR/$_UUA_JOB.act"
+}
+
+
+# Hands variables $@ to the main shell, which sets them before it starts
+# the jobs that depend on this one: nvm use changes PATH in the job's
+# own subshell only.
+_job_export() {
+  local name flag
+
+  [[ -n "$_UUA_JOB" ]] || return 0
+
+  for name; do
+    (( ${+parameters[$name]} )) || continue
+
+    flag=-g
+    [[ "$parameters[$name]" == *export* ]] && flag=-gx
+    print -r -- "typeset $flag $name=${(qP)name}" >>"$_UUA_JOB_DIR/$_UUA_JOB.env"
+  done
+}
 
 
 # Reports a failed step, with the tail of its log when there is one.
 _step_error() {
-  _fail "$1"
-  [[ -n "${2:-}" ]] && _show_log_tail "$2"
+  _row failed "$1"
+  [[ -n "${2:-}" ]] && _sub_tail "$2"
   _mark_failed
 
   return 1
@@ -176,14 +316,32 @@ _is_my_child() {
 }
 
 
+# The pids of $1's children.
+_children() {
+  local -a files
+  local f
+
+  reply=()
+  files=(/proc/$1/task/*/children(N))
+
+  if (( $#files )); then
+    for f in $files; do
+      reply+=($(<$f))
+    done
+  else
+    reply=(${(f)"$(pgrep -P "$1" 2>/dev/null)"})
+  fi
+}
+
+
 # Terminates $1 and everything it started. The whole tree is stopped
 # before anything is signalled, so no process can fork past the walk or
 # be reparented out of it when its parent dies first. Background jobs
 # ignore SIGINT, so without this a Ctrl-C would leave npm or curl
 # running (and writing) after uua has exited.
 _kill_tree() {
-  local -a tree queue kids files
-  local pid f n i
+  local -a tree queue
+  local pid n i
 
   queue=($1)
 
@@ -194,18 +352,8 @@ _kill_tree() {
     kill -STOP "$pid" 2>/dev/null || continue
     tree+=($pid)
 
-    files=(/proc/$pid/task/*/children(N))
-    kids=()
-
-    if (( $#files )); then
-      for f in $files; do
-        kids+=($(<$f))
-      done
-    else
-      kids=(${(f)"$(pgrep -P "$pid" 2>/dev/null)"})
-    fi
-
-    queue+=($kids)
+    _children "$pid"
+    queue+=($reply)
   done
 
   (( $#tree )) || return 0
@@ -232,53 +380,69 @@ _kill_tree() {
 }
 
 
+# Sends signal $1 to $2 and everything it started, stopping and killing
+# nothing: APT gets the Ctrl-C it would get in the foreground, which it
+# ignores while dpkg runs. Root's processes refuse it; sudo relays it.
+_signal_tree() {
+  local -a queue
+  local pid
+
+  queue=($2)
+
+  while (( $#queue )); do
+    pid=$queue[1]
+    shift queue
+
+    kill -"$1" "$pid" 2>/dev/null
+
+    _children "$pid"
+    queue+=($reply)
+  done
+}
+
+
+# Runs "$@" with its output passing through, stopping it (and everything
+# it started) after $1 seconds and returning 124 then, as timeout(1)
+# does. Unlike timeout(1) it runs shell functions: nvm is one.
+_limited() {
+  local limit="$1"
+  local pid deadline rc
+
+  shift
+
+  "$@" </dev/null &
+  pid=$!
+  _UUA_CHILD_PIDS+=($pid)
+  deadline=$(( EPOCHSECONDS + limit ))
+
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( EPOCHSECONDS >= deadline )); then
+      _kill_tree "$pid"
+      wait "$pid" 2>/dev/null
+      _forget_child "$pid"
+      return 124
+    fi
+
+    _tick
+  done
+
+  wait "$pid"
+  rc=$?
+  _forget_child "$pid"
+
+  return "$rc"
+}
+
+
 # ─────────────────────────────────────────────────────────────
-# Spinners
+# Running commands
 # ─────────────────────────────────────────────────────────────
 
-_UUA_FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
-_UUA_FRAME=1
-
-
-# Animated only on a terminal, and not under --verbose, where the
-# commands' own output takes the line.
-_spinning() {
-  [[ -t 2 ]] && (( ! _UUA_VERBOSE ))
-}
-
-
-_spin_frame() {
-  printf '\r\033[2K%s%s%s  %s' \
-    "$C_MAGENTA" "$_UUA_FRAMES[_UUA_FRAME]" "$C_RESET" "$1" >&2
-
-  (( _UUA_FRAME = _UUA_FRAME % $#_UUA_FRAMES + 1 ))
-}
-
-
-# Without a terminal the redraws cannot overwrite each other and would
-# pile up as thousands of lines in a log or pipe; the label is printed
-# once instead, as it is under --verbose.
-_spin_begin() {
-  if _spinning; then
-    printf '\033[?25l' >&2
-  else
-    printf '   %s\n' "$1" >&2
-  fi
-}
-
-
-_spin_end() {
-  _spinning && printf '\r\033[2K\033[?25h' >&2
-
-  return 0
-}
-
-
-# --verbose output: each line indented and dimmed. tail's "==> file <=="
-# headers become a "[name] " prefix when label is set (the parallel
-# stage, where several logs interleave), and blank lines are dropped
-# (tail puts one before each header). fflush keeps mawk from holding
-# the lines back until the end.
+# --verbose output: each line indented, dimmed and prefixed with the
+# name of the log it comes from, "[npm-install]". tail's "==> file <=="
+# headers switch the name when it follows several logs; name is the
+# default. Blank lines are dropped (tail puts one before each header),
+# and fflush keeps mawk from holding the lines back until the end.
 _UUA_VERBOSE_AWK='
   /^==> .* <==$/ {
     name = $0
@@ -292,31 +456,37 @@ _UUA_VERBOSE_AWK='
   /^$/ { next }
 
   {
-    printf "   %s%s%s%s\n", dim, (label ? "[" name "] " : ""), $0, reset
+    printf "   %s[%s] %s%s\n", dim, name, $0, reset
     fflush()
   }
 '
 
 
+# Filters files $2... (or stdin) into the --verbose stream, or to stdout
+# where there is none (the tests), naming the lines $1 until a header
+# says otherwise.
 _verbose_filter() {
-  awk -v label="$1" -v dim="$C_DIM" -v reset="$C_RESET" "$_UUA_VERBOSE_AWK" "${@:2}"
+  if [[ -n "$_UUA_STREAM" ]]; then
+    awk -v name="$1" -v dim="$C_DIM" -v reset="$C_RESET" "$_UUA_VERBOSE_AWK" "${@:2}" >>"$_UUA_STREAM"
+  else
+    awk -v name="$1" -v dim="$C_DIM" -v reset="$C_RESET" "$_UUA_VERBOSE_AWK" "${@:2}"
+  fi
 }
 
 
-# Streams the files $2... to stdout as they grow, until _follow_stop; a
-# non-empty $1 labels each line with its file's name. -F picks up files
-# that do not exist yet. tail exits once the sentinel is gone, after
+# Streams logs $@ as they grow, until _follow_stop. -F picks up logs
+# that do not exist yet; tail exits once the sentinel is gone, after
 # printing what is left, so nothing is cut off.
 _follow_start() {
-  local label="$1"
+  local name="${1:t}"
 
-  shift
+  name="${name%.log}"
 
   sleep infinity &
   _UUA_FOLLOW=($!)
 
   tail -n +1 -F -s 0.1 --pid="$_UUA_FOLLOW[1]" -- "$@" 2>/dev/null |
-    _verbose_filter "$label" &
+    _verbose_filter "$name" &
   _UUA_FOLLOW+=($!)
 
   _UUA_CHILD_PIDS+=($_UUA_FOLLOW)
@@ -340,10 +510,10 @@ _follow_stop() {
 
 
 # Runs "$@" in this shell (nvm use has to change its PATH), appending its
-# output to log $1; --verbose prints the output too, once it is done.
+# output to log $1; --verbose streams the output too, once it is done.
 _run_logged() {
   local log="$1"
-  local rc
+  local rc name="${${1:t}%.log}"
 
   shift
 
@@ -351,24 +521,22 @@ _run_logged() {
   rc=$?
 
   cat -- "$log.part" >>"$log"
-  (( _UUA_VERBOSE )) && _verbose_filter "" "$log.part"
+  (( _UUA_VERBOSE )) && _verbose_filter "$name" "$log.part"
   rm -f -- "$log.part"
 
   return "$rc"
 }
 
 
-# Runs "$@" with stdout in $2 and stderr in $2.err while a spinner
-# labelled $1 animates, or, under --verbose, while both stream to the
-# terminal. The two stay apart in the logs so a warning cannot be parsed
-# as the version a caller greps out of stdout.
+# Runs "$@" as the job's activity $1, with stdout in $2 and stderr in
+# $2.err (under --verbose both stream as well). The two stay apart so a
+# warning cannot be parsed as the version a caller greps out of stdout.
 #
 # With a time limit ($3 seconds) the command runs in the background and
 # is stopped, with everything it started, when the limit passes; 124 is
-# returned then, as timeout(1) does. With 0 it runs in the foreground,
-# where Ctrl-C reaches it through the terminal: that is how APT runs,
-# since dpkg is root's and must not be cut off by a timer.
-_run_spinner() {
+# returned then, as timeout(1) does. With 0 it runs to the end: that is
+# how APT runs, since dpkg is root's and must not be cut off by a timer.
+_run_task() {
   local label="$1"
   local logfile="$2"
   local limit="$3"
@@ -376,52 +544,36 @@ _run_spinner() {
 
   shift 3
 
-  _spin_begin "$label"
-
-  if (( _UUA_VERBOSE )); then
-    : >"$logfile"
-    : >"$logfile.err"
-    _follow_start "" "$logfile" "$logfile.err"
+  # After Ctrl-C nothing new starts. APT, left to finish what it is
+  # running, ends its job here, and the board reports it interrupted.
+  if [[ -n "$_UUA_JOB" && -e "$_UUA_JOB_DIR/.stop" ]]; then
+    _sub note "not started: $label"
+    exit 130
   fi
 
+  _activity "$label" "$logfile"
+
+  : >"$logfile"
+  : >"$logfile.err"
+  (( _UUA_VERBOSE )) && _follow_start "$logfile" "$logfile.err"
+
   if (( limit == 0 )); then
-    if _spinning; then
-      (
-        trap 'exit 0' TERM
-
-        while true; do
-          _spin_frame "$label"
-          _tick
-        done
-      ) &
-
-      pid=$!
-      _UUA_CHILD_PIDS+=($pid)
-    fi
-
     "$@" </dev/null >"$logfile" 2>"$logfile.err"
     rc=$?
-
-    if [[ -n "$pid" ]]; then
-      kill "$pid" 2>/dev/null
-      wait "$pid" 2>/dev/null
-      _forget_child "$pid"
-    fi
   else
-    "$@" >"$logfile" 2>"$logfile.err" &
+    "$@" </dev/null >"$logfile" 2>"$logfile.err" &
     pid=$!
     _UUA_CHILD_PIDS+=($pid)
-    deadline=$(( SECONDS + limit ))
+    deadline=$(( EPOCHSECONDS + limit ))
 
     while kill -0 "$pid" 2>/dev/null; do
-      if (( SECONDS >= deadline )); then
+      if (( EPOCHSECONDS >= deadline )); then
         _kill_tree "$pid"
         print -r -- "uua: stopped after ${limit}s without finishing" >>"$logfile.err"
         rc=124
         break
       fi
 
-      _spinning && _spin_frame "$label"
       _tick
     done
 
@@ -432,7 +584,6 @@ _run_spinner() {
   fi
 
   _follow_stop
-  _spin_end
 
   return "$rc"
 }
@@ -445,12 +596,6 @@ _run_spinner() {
 _uua_ver() {
   "$@" 2>/dev/null |
     grep -Eo "$_UUA_VER_RE" |
-    head -n 1
-}
-
-
-_ver_from_log() {
-  grep -Eo "$_UUA_VER_RE" "$1" 2>/dev/null |
     head -n 1
 }
 
@@ -484,22 +629,21 @@ _ver_needs_update() {
 }
 
 
-# Reports $1 as up to date or, in --check mode, as updatable. True only
-# when the caller should go on to install $3 over $2.
+# Reports the job's tool as up to date or, in --check mode, as
+# updatable. True only when the caller should go on to install $2 over
+# $1.
 _needs_install() {
-  local label="$1"
-  local current="$2"
-  local latest="$3"
+  local current="$1"
+  local latest="$2"
 
   if ! _ver_needs_update "$current" "$latest"; then
-    _ok "$label: $current (up to date)"
+    _row ok "$current · up to date"
     _mark_uptodate
     return 1
   fi
 
-  _update "$label: $current → $latest"
-
   if (( _UUA_CHECK_ONLY )); then
+    _row available "$current → $latest · update available"
     _mark_available
     return 1
   fi
@@ -508,27 +652,26 @@ _needs_install() {
 }
 
 
-# Reports an install that took $1 from $2 to $3. An installer that exits
-# 0 without moving the version (a channel lagging the registry, say) is
-# a failure, not an upgrade.
+# Reports an install that took the job's tool from $1 to $2. An
+# installer that exits 0 without moving the version (a channel lagging
+# the registry, say) is a failure, not an upgrade.
 _finish_upgrade() {
-  local label="$1"
-  local current="$2"
-  local after="$3"
-  local note="$4"
-  local log="$5"
+  local current="$1"
+  local after="$2"
+  local note="$3"
+  local log="$4"
 
   if [[ -z "$after" ]]; then
-    _step_error "$label: not runnable after the update" "$log"
+    _step_error "not runnable after the update" "$log"
     return
   fi
 
   if [[ "$after" == "$current" ]]; then
-    _step_error "$label: update finished but the version is still $current" "$log"
+    _step_error "update finished but the version is still $current" "$log"
     return
   fi
 
-  _ok "$label: $current → $after (upgraded${note:+, $note})"
+  _row updated "$current → $after · upgraded${note:+, $note}"
   _mark_updated
 }
 
@@ -554,6 +697,46 @@ _codex_latest() {
 }
 
 
+# The latest Bun release, from where GitHub's "latest" link redirects.
+_bun_latest() {
+  local tag
+
+  command -v curl >/dev/null 2>&1 || return 1
+
+  tag="$(
+    curl -fsSL --max-time 20 --retry 2 -o /dev/null -w '%{url_effective}' \
+      https://github.com/oven-sh/bun/releases/latest 2>/dev/null |
+      grep -Eo 'bun-v[0-9]+(\.[0-9]+){1,3}' |
+      tail -n 1
+  )"
+
+  [[ -n "$tag" ]] && print -r -- "${tag#bun-v}"
+}
+
+
+# The latest LTS release, read straight from the index nvm reads (at the
+# mirror nvm would use): nvm version-remote takes seconds longer to say
+# the same. The first row with an LTS name is the newest LTS; nvm is
+# the fallback.
+_node_lts_remote() {
+  local v
+
+  if command -v curl >/dev/null 2>&1; then
+    v="$(
+      curl -fsSL --max-time 20 --retry 2 \
+        "${NVM_NODEJS_ORG_MIRROR:-https://nodejs.org/dist}/index.tab" 2>/dev/null |
+        awk -F '\t' 'NR > 1 && $10 != "-" && $10 != "" { print $1; exit }'
+    )"
+
+    [[ "$v" == v[0-9]* ]] && { print -r -- "$v"; return 0 }
+  fi
+
+  _load_nvm || return 1
+
+  nvm version-remote 'lts/*'
+}
+
+
 # The latest release for a version source: "npm:<package>" or the name
 # of a function that prints it.
 _latest_version() {
@@ -564,6 +747,61 @@ _latest_version() {
   else
     ${=1}
   fi
+}
+
+
+# ─────────────────────────────────────────────────────────────
+# Prefetched queries
+# ─────────────────────────────────────────────────────────────
+#
+# The registry and release queries depend on nothing local, so they all
+# go out together before the sudo prompt, and each job reads its answer
+# when it gets there instead of asking in turn.
+
+# Runs "$@" in the background under a limit of $2 seconds, keeping its
+# output and status for _fetch under key $1. The .run marker, written
+# before anything starts, holds how long a reader should wait.
+_prefetch() {
+  local f="$_UUA_CACHE/$1"
+  local limit="$2"
+
+  shift 2
+
+  print -r -- $(( EPOCHSECONDS + limit + 5 )) >"$f.run"
+
+  (
+    _limited "$limit" "$@" >"$f.out" 2>/dev/null
+    print -r -- $? >"$f.rc"
+  ) &
+
+  _UUA_CHILD_PIDS+=($!)
+}
+
+
+# The output of "$@": the answer prefetched under key $1 when there is
+# one, waiting for it while it is still out, or else a query made now
+# under a limit of $2 seconds.
+_fetch() {
+  local f="$_UUA_CACHE/$1"
+  local limit="$2"
+  local deadline
+
+  shift 2
+
+  if [[ -n "$_UUA_CACHE" && -s "$f.run" ]]; then
+    deadline="$(<"$f.run")"
+
+    while [[ ! -s "$f.rc" ]] && (( EPOCHSECONDS < deadline )); do
+      _tick
+    done
+
+    if [[ -s "$f.rc" ]]; then
+      [[ -s "$f.out" ]] && print -r -- "$(<"$f.out")"
+      return "$(<"$f.rc")"
+    fi
+  fi
+
+  _limited "$limit" "$@"
 }
 
 
@@ -598,21 +836,54 @@ _is_npm_managed() {
 }
 
 
+_is_bun_managed() {
+  local bin
+
+  bin="$(command -v "$1" 2>/dev/null)"
+  [[ "$bin" == /* ]] || return 1
+
+  [[ "${bin:A}" == "$(_bun_global_root)"/* ]]
+}
+
+
+# dpkg is asked only about files outside $HOME, where it never installs.
 _is_apt_managed() {
   local bin
 
   command -v dpkg-query >/dev/null 2>&1 || return 1
 
   bin="$(command -v "$1" 2>/dev/null)"
-  [[ "$bin" == /* ]] || return 1
+  [[ "$bin" == /* && "${bin:A}" != "$HOME"/* ]] || return 1
 
   dpkg-query -S "${bin:A}" >/dev/null 2>&1
 }
 
 
+# Which package manager installed command $1, into REPLY: apt, npm or
+# bun, "native" for an installer of its own, "absent" when it is not
+# installed. It decides what the tool's job waits for.
+_tool_owner() {
+  local bin real
+
+  REPLY=absent
+  bin="$(command -v "$1" 2>/dev/null)" || return 0
+
+  REPLY=native
+  [[ "$bin" == /* ]] || return 0
+  real="${bin:A}"
+
+  if _is_apt_managed "$1"; then
+    REPLY=apt
+  elif _is_npm_managed "$1" || [[ -n "${NVM_DIR:-}" && "$real" == "$NVM_DIR"/versions/node/* ]]; then
+    REPLY=npm
+  elif _is_bun_managed "$1"; then
+    REPLY=bun
+  fi
+}
+
+
 # The npm step resolves this, but a filtered run (--ai alone) skips it
-# while the CLI workers still need it to recognize npm-managed
-# executables.
+# while the CLI jobs still need it to recognize npm-managed executables.
 _resolve_npm_root() {
   [[ -n "$_UUA_NPM_ROOT" ]] && return 0
   command -v npm >/dev/null 2>&1 || return 0
@@ -623,11 +894,21 @@ _resolve_npm_root() {
 }
 
 
-# Serializes writes to the global npm tree between the parallel
-# workers; reads of the registry and cache need no lock. -o keeps the
-# lock's descriptor out of npm and anything npm leaves running.
-_with_npm_lock() {
-  flock -o "$_UUA_LOG_ROOT/npm.lock" "$@"
+# Runs "$@" under the lock of global package tree $1 (npm or bun), which
+# the jobs sharing that tree take to write it; "-s" after the name takes
+# it shared, to read the tree while nothing writes it. -o keeps the
+# lock's descriptor out of the command and anything it leaves running.
+_with_lock() {
+  local lock="$_UUA_LOG_ROOT/$1.lock"
+
+  shift
+
+  if [[ "$1" == -s ]]; then
+    shift
+    flock -s -o "$lock" "$@"
+  else
+    flock -o "$lock" "$@"
+  fi
 }
 
 
@@ -677,7 +958,7 @@ _release_run_lock() {
 # "updating" one would replace it with the registry release of the same
 # name.
 _npm_global_packages() {
-  npm ls -g --depth=0 --json 2>/dev/null |
+  _with_lock npm -s npm ls -g --depth=0 --json 2>/dev/null |
     node -e '
       let tree = {};
       try { tree = JSON.parse(require("fs").readFileSync(0, "utf8")); } catch { process.exit(1); }
@@ -705,7 +986,7 @@ _bun_global_packages() {
   [[ -f "$root/package.json" ]] || return 1
   command -v node >/dev/null 2>&1 || js=bun
 
-  "$js" -e '
+  _with_lock bun -s "$js" -e '
     const fs = require("fs"), path = require("path"), root = process.argv[1];
     const read = (...p) => JSON.parse(fs.readFileSync(path.join(root, ...p), "utf8"));
     for (const [name, spec] of Object.entries(read("package.json").dependencies || {})) {
@@ -716,7 +997,7 @@ _bun_global_packages() {
 }
 
 
-# Packages another step already owns, so the global sweeps leave them
+# Packages another job already owns, so the global sweeps leave them
 # be. npm and corepack ship with Node and follow its install.
 _managed_packages() {
   local row
@@ -730,13 +1011,48 @@ _managed_packages() {
 }
 
 
-# Reads "name version" lines and prints "name current latest" for each
-# package a newer registry release exists for. The lookups run eight at
-# a time: one npm process per package, in turn, takes seconds each.
-_outdated_packages() {
+# "name version" for each package $@ from the registry, eight lookups at
+# a time (one npm process per package, in turn, takes seconds each);
+# "name -" for a lookup that failed.
+_registry_latest() {
+  print -rl -- "$@" |
+    xargs -P 8 -n 1 sh -c '
+      v=$(timeout "$0" npm view "$1" version --silent 2>/dev/null | head -n 1)
+      printf "%s %s\n" "$1" "${v:--}"
+    ' "$_UUA_QUERY_LIMIT"
+}
+
+
+# The registry's latest release of each package lister $1 reports,
+# except the ones another job owns: what a sweep compares against,
+# looked up ahead of it.
+_globals_latest() {
   local -a managed names
-  local -A current latest
   local name version
+
+  managed=(${(f)"$(_managed_packages)"})
+
+  while read -r name version; do
+    [[ -n "$name" ]] || continue
+    (( ${managed[(Ie)$name]} )) && continue
+
+    names+=("$name")
+  done < <("$1")
+
+  (( $#names )) && _registry_latest $names
+
+  return 0
+}
+
+
+# Reads "name version" lines and prints "name current latest" for each
+# package a newer registry release exists for. The latest releases come
+# prefetched under key $1 when given; packages it lacks are looked up.
+_outdated_packages() {
+  local cache="${1:-}"
+  local -a managed names missing
+  local -A current latest
+  local name version found=0
 
   managed=(${(f)"$(_managed_packages)"})
 
@@ -750,21 +1066,33 @@ _outdated_packages() {
 
   (( $#names )) || return 0
 
-  while read -r name version; do
-    latest[$name]="$version"
-  done < <(
-    print -rl -- $names |
-      xargs -P 8 -n 1 sh -c '
-        v=$(timeout "$0" npm view "$1" version --silent 2>/dev/null | head -n 1)
-        [ -n "$v" ] && printf "%s %s\n" "$1" "$v"
-      ' "$_UUA_QUERY_LIMIT"
-  )
+  if [[ -n "$cache" ]]; then
+    while read -r name version; do
+      [[ -n "$name" ]] && latest[$name]="$version"
+    done < <(_fetch "$cache" "$_UUA_QUERY_LIMIT" true)
+  fi
+
+  for name in $names; do
+    (( ${+latest[$name]} )) || missing+=("$name")
+  done
+
+  if (( $#missing )); then
+    while read -r name version; do
+      [[ -n "$name" ]] && latest[$name]="$version"
+    done < <(_registry_latest $missing)
+  fi
+
+  for name in $names; do
+    [[ -n "$latest[$name]" && "$latest[$name]" != - ]] && (( found++ ))
+  done
 
   # Every lookup failing means the registry is unreachable, which must
   # not be reported as "everything is current".
-  (( $#latest )) || return 1
+  (( found )) || return 1
 
   for name in $names; do
+    [[ "$latest[$name]" == - ]] && continue
+
     _ver_needs_update "$current[$name]" "$latest[$name]" &&
       print -r -- "$name $current[$name] $latest[$name]"
   done
@@ -776,7 +1104,7 @@ _outdated_packages() {
 _list_outdated() {
   setopt localoptions pipefail
 
-  "$1" | _outdated_packages
+  "$1" | _outdated_packages "${2:-}"
 }
 
 
@@ -802,67 +1130,83 @@ _still_outdated() {
 }
 
 
-# One global sweep: every registry package except those another step
+# One global sweep: every registry package except those another job
 # owns, updated in one install and listed again afterwards, so one the
 # installer skipped is reported rather than counted as upgraded. $3 is
-# appended to each package name to form the install spec; the rest is
-# the install command.
+# appended to each package name to form the install spec, $4 is the
+# prefetch key of the latest releases; the rest is the install command.
 _sweep_globals() {
   local label="$1"
   local lister="$2"
   local spec="$3"
+  local cache="$4"
   local log="$_UUA_RUN_DIR/${label// /-}"
   local outdated name current latest
-  local -a targets stuck
+  local -a names targets stuck
 
-  shift 3
+  shift 4
 
-  _run_spinner "Checking $label" "$log-check.log" "$_UUA_INSTALL_LIMIT" \
-    _list_outdated "$lister" ||
-    { _step_error "$label: unable to query the registry" "$log-check.log"; return }
+  _phase 0 0.4 2
+  _run_task "checking the registry" "$log-check.log" "$_UUA_INSTALL_LIMIT" \
+    _list_outdated "$lister" "$cache" ||
+    { _step_error "unable to query the registry" "$log-check.log"; return }
 
   outdated="$(<"$log-check.log")"
 
   if [[ -z "$outdated" ]]; then
-    _ok "$label: up to date"
+    _row ok "up to date"
     _mark_uptodate
     return 0
   fi
 
   while read -r name current latest; do
-    _update "$label: $name $current → $latest"
+    names+=("$name")
     targets+=("$name$spec")
   done <<<"$outdated"
 
   if (( _UUA_CHECK_ONLY )); then
+    _row available "$#names update(s) available"
+
+    while read -r name current latest; do
+      _sub available "$name $current → $latest"
+    done <<<"$outdated"
+
     _mark_available
     return 0
   fi
 
-  _run_spinner "Updating $#targets $label" "$log-install.log" "$_UUA_INSTALL_LIMIT" \
+  _phase 0.4 0.92 8
+  _run_task "updating ${(j:, :)names}" "$log-install.log" "$_UUA_INSTALL_LIMIT" \
     "$@" "${targets[@]}" ||
-    { _step_error "$label: update failed" "$log-install.log"; return }
+    { _step_error "update failed" "$log-install.log"; return }
 
+  _phase 0.92 0.98 1
+  _activity "verifying the update"
   stuck=(${(f)"$(_still_outdated "$lister" "$outdated")"})
 
   if (( $#stuck )); then
-    _step_error "$label: still outdated after the update: ${(j:, :)stuck}" "$log-install.log"
+    _step_error "still outdated after the update: ${(j:, :)stuck}" "$log-install.log"
     return
   fi
 
-  _ok "$label: $#targets package(s) upgraded"
+  _row updated "$#names package(s) upgraded"
+
+  while read -r name current latest; do
+    _sub updated "$name $current → $latest"
+  done <<<"$outdated"
+
   _mark_updated
 }
 
 
 # ─────────────────────────────────────────────────────────────
-# 0. sudo
+# sudo
 # ─────────────────────────────────────────────────────────────
 
 # Refreshes the cached sudo credentials so a long run cannot lose root
 # halfway through. -n never prompts: if the timestamp is gone the loop
-# ends quietly and the apt step reports the problem instead of a prompt
-# appearing mid-spinner.
+# ends quietly and the apt job reports the problem instead of a prompt
+# appearing behind the board.
 _sudo_keepalive_start() {
   (
     while sudo -n true 2>/dev/null; do
@@ -874,22 +1218,20 @@ _sudo_keepalive_start() {
 }
 
 
-# Collects the password before anything else runs, while the terminal
-# is still quiet.
+# Collects the password before the board starts, while the terminal is
+# still quiet; cached credentials skip the prompt altogether.
 _collect_sudo_password() {
   if ! command -v sudo >/dev/null 2>&1; then
-    _warn "sudo: not installed (the apt step will report the problem)"
+    _warn "sudo: not installed (the apt job will report the problem)"
     return 0
   fi
 
-  _section "sudo"
-
-  if ! sudo -v; then
-    _step_error "sudo: password collection failed or cancelled"
-    return
+  if ! sudo -v -p "${C_CYAN}◆${C_RESET} sudo password for %u (for apt): "; then
+    _fail "sudo: password collection failed or cancelled"
+    _mark_failed
+    return 1
   fi
 
-  _ok "sudo: password collected"
   _sudo_keepalive_start
 
   return 0
@@ -897,13 +1239,13 @@ _collect_sudo_password() {
 
 
 # ─────────────────────────────────────────────────────────────
-# 1. APT
+# Job: APT
 # ─────────────────────────────────────────────────────────────
 
 # Unattended by construction: a conffile prompt or a needrestart dialog
-# would block invisibly behind the spinner, and sudo -n fails rather
-# than prompt. The lock timeout waits out unattended-upgrades instead
-# of failing on its lock.
+# would block invisibly behind the board, and sudo -n fails rather than
+# prompt. The lock timeout waits out unattended-upgrades instead of
+# failing on its lock.
 _sudo_apt() {
   sudo -n env \
     DEBIAN_FRONTEND=noninteractive \
@@ -929,94 +1271,119 @@ _apt_unused() {
 }
 
 
+# Runs both simulations side by side (they only read), into the
+# variables named $1 (upgrades pending) and $2 (packages nothing needs).
+_apt_simulate() {
+  local tmp="$_UUA_RUN_DIR/apt-simulate"
+  local pid
+
+  _apt_pending >"$tmp.pending" &
+  pid=$!
+  _apt_unused >"$tmp.unused"
+  wait "$pid"
+
+  : ${(P)1::=$(<"$tmp.pending")} ${(P)2::=$(<"$tmp.unused")}
+}
+
+
 _apt_prune() {
   local log="$1"
-  local unused
+  local unused="${2:-0}"
 
-  unused="$(_apt_unused)"
   (( unused )) || return 0
 
   if (( ! _UUA_PRUNE || _UUA_CHECK_ONLY )); then
-    _info "apt: $unused unused package(s); --prune removes them"
+    _sub info "$unused unused package(s); --prune removes them"
     return 0
   fi
 
-  if _run_spinner "Removing unused APT packages" "$log" 0 _sudo_apt autoremove; then
-    _ok "apt: $unused unused package(s) removed"
+  _phase 0.97 0.99 2 "Removing" "$unused"
+
+  if _run_task "removing $unused unused package(s)" "$log" 0 _sudo_apt autoremove; then
+    _sub ok "$unused unused package(s) removed"
   else
-    _warn "apt: autoremove failed"
-    _show_log_tail "$log"
+    _sub warn "autoremove failed"
+    _sub_tail "$log"
   fi
 }
 
 
 _step_apt() {
   local log="$_UUA_RUN_DIR/apt"
-  local pending left note=""
-
-  _section "apt"
+  local pending left unused=0 note=""
 
   if ! command -v apt-get >/dev/null 2>&1; then
-    _absent "apt: not available on this system"
+    _row absent "not available on this system"
     return 0
   fi
 
   # Check mode neither asks for a password nor rewrites the package
   # lists, so it reports against whatever metadata is already on disk.
   if (( _UUA_CHECK_ONLY )); then
-    pending="$(_apt_pending)"
+    _phase 0 0.95 1
+    _activity "simulating the upgrade"
+    _apt_simulate pending unused
 
     if (( pending )); then
-      _update "apt: $pending update(s) available (metadata not refreshed)"
+      _row available "$pending update(s) available · metadata not refreshed"
       _mark_available
     else
-      _ok "apt: up to date (metadata not refreshed)"
+      _row ok "up to date · metadata not refreshed"
       _mark_uptodate
     fi
 
-    _apt_prune
+    _apt_prune "" "$unused"
     [[ -f /var/run/reboot-required ]] && _UUA_REBOOT=1
 
     return 0
   fi
 
   command -v sudo >/dev/null 2>&1 ||
-    { _step_error "apt: sudo not installed"; return }
+    { _step_error "sudo not installed"; return }
 
   # The password was collected up front; credentials that expired since
-  # then are a failure rather than an invisible mid-spinner prompt.
+  # then are a failure rather than an invisible prompt.
   sudo -n true 2>/dev/null ||
-    { _step_error "apt: sudo credentials expired (re-run uua)"; return }
+    { _step_error "sudo credentials expired (re-run uua)"; return }
 
-  _run_spinner "Refreshing APT package metadata" "$log-update.log" 0 _sudo_apt update ||
-    { _step_error "apt: repository refresh failed" "$log-update.log"; return }
+  _phase 0 0.3 4
+  _run_task "refreshing package metadata" "$log-update.log" 0 _sudo_apt update ||
+    { _step_error "repository refresh failed" "$log-update.log"; return }
 
+  _phase 0.3 0.35 1
+  _activity "resolving upgrades"
   pending="$(_apt_pending)"
 
   if (( pending == 0 )); then
-    _ok "apt: up to date"
+    _phase 0.35 0.95 1
+    _activity "looking for unused packages"
+    unused="$(_apt_unused)"
+
+    _row ok "up to date"
     _mark_uptodate
   else
-    _update "apt: $pending update(s) available"
-
-    _run_spinner "Installing APT updates" "$log-upgrade.log" 0 \
+    # dpkg prints "Setting up" once for each package it has installed.
+    _phase 0.35 0.95 10 "Setting up" "$pending"
+    _run_task "installing $pending update(s)" "$log-upgrade.log" 0 \
       _sudo_apt upgrade --with-new-pkgs ||
-      { _step_error "apt: upgrade failed" "$log-upgrade.log"; return }
+      { _step_error "upgrade failed" "$log-upgrade.log"; return }
 
-    left="$(_apt_pending)"
+    _phase 0.95 0.97 1
+    _activity "verifying the upgrade"
+    _apt_simulate left unused
 
     if (( left >= pending )); then
-      _step_error "apt: upgrade finished but $left package(s) are still pending" "$log-upgrade.log"
+      _step_error "upgrade finished but $left package(s) are still pending" "$log-upgrade.log"
       return
     fi
 
     (( left )) && note=", $left still pending"
 
-    _ok "apt: upgraded ($(( pending - left )) package(s)$note)"
+    _row updated "$(( pending - left )) package(s) upgraded$note"
     _mark_updated
   fi
 
-  _apt_prune "$log-autoremove.log"
+  _apt_prune "$log-autoremove.log" "$unused"
   [[ -f /var/run/reboot-required ]] && _UUA_REBOOT=1
 
   return 0
@@ -1024,7 +1391,7 @@ _step_apt() {
 
 
 # ─────────────────────────────────────────────────────────────
-# 2. Node.js / nvm
+# Job: Node.js / nvm
 # ─────────────────────────────────────────────────────────────
 
 _load_nvm() {
@@ -1094,10 +1461,9 @@ _default_should_follow() {
 }
 
 
-# The steps after node (npm, the global sweeps, the AI CLIs) update the
-# installation new shells get, the nvm default, rather than whatever the
-# invoking shell has active (an .nvmrc, say); "uua" and "uua --ai" then
-# update the same one.
+# The jobs update the installation new shells get, the nvm default,
+# rather than whatever the invoking shell has active (an .nvmrc, say);
+# "uua" and "uua --ai" then update the same one.
 _use_default_node() {
   _load_nvm || return 0
   [[ -n "$(_nvm_default_alias)" ]] || return 0
@@ -1115,61 +1481,64 @@ _use_default_node() {
 _UUA_NODE_PENDING="$_UUA_LOG_ROOT/node-packages-pending"
 
 
+# The Node the jobs after this one use, handed to the main shell.
+_export_node() {
+  rehash 2>/dev/null
+  _job_export PATH NVM_BIN NVM_INC MANPATH
+}
+
+
 _step_node() {
   local log="$_UUA_RUN_DIR/node"
-  local active installed latest target after from replaced="" pinned=""
-  local alias_target default
-  local v removed=0 busy=0 failed=0 active_removed=0 upgraded=0
+  local active="$_UUA_ACTIVE_NODE"
+  local installed latest target after from replaced="" pinned=""
+  local alias_target default note
+  local upgraded=0
   local -a install_args stale notes pending
 
-  _section "node"
-
   if ! _load_nvm; then
-    _absent "node: nvm not installed"
+    _row absent "nvm not installed"
     return 0
   fi
 
-  active="$(_strip_v "$(nvm current 2>/dev/null)")"
   alias_target="$(_nvm_default_alias)"
 
   # Compare the newest locally installed LTS rather than the active
   # version; an old .nvmrc must not keep the LTS from advancing.
   installed="$(_nvm_ver 'lts/*')"
 
-  _run_spinner "Checking latest Node.js LTS" "$log-remote.log" "$_UUA_QUERY_LIMIT" \
-    nvm version-remote 'lts/*' ||
-    { _step_error "node: unable to query the latest LTS" "$log-remote.log"; return }
+  _phase 0 0.15 1
+  _activity "checking the latest LTS"
+
+  _fetch node-lts "$_UUA_QUERY_LIMIT" _node_lts_remote >"$log-remote.log" 2>&1 ||
+    { _step_error "unable to query the latest LTS" "$log-remote.log"; return }
 
   latest="$(grep -Eo '[0-9]+(\.[0-9]+){2}' "$log-remote.log" | tail -n 1)"
 
   [[ -n "$latest" ]] ||
-    { _step_error "node: unable to detect the latest LTS version" "$log-remote.log"; return }
+    { _step_error "unable to detect the latest LTS version" "$log-remote.log"; return }
 
   if [[ -n "$installed" ]] && ! _ver_needs_update "$installed" "$latest"; then
     target="$installed"
 
     if (( _UUA_CHECK_ONLY )); then
       if [[ "$active" == "$installed" ]]; then
-        _ok "node: $installed (up to date, latest LTS)"
+        _row ok "$installed · latest LTS"
       else
-        _ok "node: LTS $installed (up to date, active: $active)"
-        _info "Node LTS $installed is not active; switch with:"
-        printf '   %snvm use lts/*%s\n' "$C_CYAN" "$C_RESET"
+        _row ok "LTS $installed · active: ${active:-none}"
+        _sub info "Node LTS $installed is not active; switch with: nvm use lts/*"
       fi
 
       [[ -r "$_UUA_NODE_PENDING" ]] &&
-        _warn "node: an earlier run did not finish moving global packages to $installed; run uua to finish"
+        _sub warn "an earlier run did not finish moving global packages to $installed; run uua to finish"
 
       _mark_uptodate
-      _use_default_node
       return 0
     fi
   else
-    _update "node: ${installed:-none} → $latest"
-
     if (( _UUA_CHECK_ONLY )); then
+      _row available "${installed:-none} → $latest · update available"
       _mark_available
-      _use_default_node
       return 0
     fi
 
@@ -1188,9 +1557,10 @@ _step_node() {
 
     # nvm install runs in the background (for its time limit), so its
     # own switch to the new version is lost; nvm use below makes it.
-    _run_spinner "Installing Node.js $latest" "$log-install.log" "$_UUA_INSTALL_LIMIT" \
+    _phase 0.15 0.85 8
+    _run_task "installing Node.js $latest" "$log-install.log" "$_UUA_INSTALL_LIMIT" \
       $install_args 'lts/*' ||
-      { _step_error "node: install failed" "$log-install.log"; return }
+      { _step_error "install of $latest failed" "$log-install.log"; return }
 
     rm -f -- "$_UUA_NODE_PENDING"
 
@@ -1199,14 +1569,17 @@ _step_node() {
     upgraded=1
   fi
 
-  _run_logged "$log-use.log" nvm use "$target" ||
-    { _step_error "node: unable to activate $target" "$log-use.log"; return }
+  _phase 0.85 0.9 1
+  _activity "activating $target"
 
-  rehash 2>/dev/null
+  _run_logged "$log-use.log" nvm use "$target" ||
+    { _step_error "unable to activate $target" "$log-use.log"; return }
+
+  _export_node
   after="$(_uua_ver node --version)"
 
   [[ "$after" == "$target" ]] ||
-    { _step_error "node: $target installed but node reports ${after:-nothing}" "$log-use.log"; return }
+    { _step_error "$target installed but node reports ${after:-nothing}" "$log-use.log"; return }
 
   # A run cut off during the install left the new LTS without the global
   # packages it was to get; nvm use above made it current for them.
@@ -1214,9 +1587,10 @@ _step_node() {
     pending=(${=$(<"$_UUA_NODE_PENDING")})
 
     if [[ "$pending[1]" == "$target" && -d "$NVM_DIR/versions/node/v$pending[2]" ]]; then
-      _run_spinner "Reinstalling global packages from $pending[2]" "$log-reinstall.log" \
+      _phase 0.9 0.97 8
+      _run_task "reinstalling global packages from $pending[2]" "$log-reinstall.log" \
         "$_UUA_INSTALL_LIMIT" nvm reinstall-packages "$pending[2]" ||
-        { _step_error "node: unable to reinstall the global packages from $pending[2]" "$log-reinstall.log"; return }
+        { _step_error "unable to reinstall the global packages from $pending[2]" "$log-reinstall.log"; return }
 
       notes+=("global packages from $pending[2] reinstalled")
     fi
@@ -1227,7 +1601,7 @@ _step_node() {
   if [[ "$alias_target" != 'lts/*' ]]; then
     if _default_should_follow "$alias_target" "$replaced"; then
       _run_logged "$log-use.log" nvm alias default 'lts/*' ||
-        { _step_error "node: unable to point the default alias at lts/*" "$log-use.log"; return }
+        { _step_error "unable to point the default alias at lts/*" "$log-use.log"; return }
 
       notes+=("default now follows lts/*")
     else
@@ -1236,190 +1610,210 @@ _step_node() {
     fi
   fi
 
-  # The later steps update the Node new shells get: this LTS, or the
+  # The later jobs update the Node new shells get: this LTS, or the
   # release the default is pinned to.
   if [[ -n "$pinned" ]]; then
     _run_logged "$log-use.log" nvm use default ||
-      { _step_error "node: unable to switch to the default ($pinned)" "$log-use.log"; return }
+      { _step_error "unable to switch to the default ($pinned)" "$log-use.log"; return }
 
-    rehash 2>/dev/null
+    _export_node
   fi
 
   default="$(_nvm_ver default)"
   stale=(${(f)"$(_nvm_stale_versions "$target" "$default")"})
 
   if (( $#stale && _UUA_PRUNE )); then
-    # nvm uninstall also cleans up aliases; it refuses the active
-    # version, which nvm use above has moved off these.
-    for v in $stale; do
-      if _in_use "$NVM_DIR/versions/node/v$v"; then
-        (( busy++ ))
-      elif _run_logged "$log-prune.log" nvm uninstall "$v"; then
-        (( removed++ ))
-        [[ "$v" == "$active" ]] && active_removed=1
-      else
-        (( failed++ ))
-      fi
-    done
-
-    (( failed )) &&
-      { _step_error "node: unable to remove $failed old release(s)" "$log-prune.log"; return }
-
-    (( removed )) && notes+=("$removed old release(s) removed")
-    (( busy )) && notes+=("$busy in use, kept")
+    # Removed by the prune job once every other job has finished, so
+    # none of them loses the Node it runs on.
+    print -rl -- $stale >"$_UUA_RUN_DIR/node-stale"
   elif (( $#stale )); then
     notes+=("$#stale older release(s) kept, --prune removes them")
   fi
 
   # A standalone CLI cannot change its parent shell's PATH; new shells
   # get the default, and this one needs a refresh.
-  if (( active_removed )) || [[ -z "$pinned" && "$active" != "$target" ]]; then
-    _UUA_NODE_CHANGED=1
-  fi
+  [[ -z "$pinned" && "$active" != "$target" ]] && _UUA_NODE_CHANGED=1
 
   if (( upgraded )); then
-    _ok "node: ${installed:-none} → $target (upgraded${notes:+, ${(j:, :)notes}})"
+    _row updated "${installed:-none} → $target · upgraded"
     _mark_updated
   else
-    _ok "node: $target (up to date, latest LTS${notes:+, ${(j:, :)notes}})"
+    _row ok "$target · latest LTS"
     _mark_uptodate
   fi
+
+  for note in $notes; do
+    _sub note "$note"
+  done
 
   return 0
 }
 
 
+# Removes the old releases the node job listed: last of all, when no
+# job can still be running one. nvm uninstall also cleans up aliases;
+# it refuses the active version, which the node job moved off these.
+_step_node_prune() {
+  local log="$_UUA_RUN_DIR/node-prune.log"
+  local list="$_UUA_RUN_DIR/node-stale"
+  local v removed=0 busy=0 failed=0
+
+  if [[ ! -s "$list" ]] || ! _load_nvm; then
+    _row ok "no old Node.js releases"
+    return 0
+  fi
+
+  _phase 0 0.95 2
+
+  for v in ${(f)"$(<"$list")"}; do
+    _activity "removing Node.js $v"
+
+    if _in_use "$NVM_DIR/versions/node/v$v"; then
+      (( busy++ ))
+    elif _run_logged "$log" nvm uninstall "$v"; then
+      (( removed++ ))
+      [[ "$v" == "$_UUA_ACTIVE_NODE" ]] && _UUA_NODE_CHANGED=1
+    else
+      (( failed++ ))
+    fi
+  done
+
+  (( failed )) &&
+    { _step_error "unable to remove $failed old release(s)" "$log"; return }
+
+  if (( busy )); then
+    _row ok "$removed old release(s) removed, $busy in use and kept"
+  else
+    _row ok "$removed old release(s) removed"
+  fi
+}
+
+
 # ─────────────────────────────────────────────────────────────
-# 3. npm
+# Job: npm
 # ─────────────────────────────────────────────────────────────
 
 _step_npm() {
   local log="$_UUA_RUN_DIR/npm"
   local current latest note=""
 
-  _section "npm"
-
   if ! command -v npm >/dev/null 2>&1; then
-    _absent "npm: not installed"
+    _row absent "not installed"
     return 0
   fi
 
   # Resolved before the registry query: if a lookup failure left this
   # empty, npm-managed CLIs would self-update outside the global lock.
   _UUA_NPM_ROOT="$(npm root -g 2>/dev/null)"
+  _job_export _UUA_NPM_ROOT
 
   current="$(npm --version 2>/dev/null)"
 
-  _run_spinner "Checking latest npm" "$log-check.log" "$_UUA_QUERY_LIMIT" \
-    npm view npm version --silent ||
-    { _step_error "npm: unable to query the registry" "$log-check.log"; return }
+  _phase 0 0.3 1
+  _activity "checking the latest npm"
+  latest="$(_fetch npm-latest "$_UUA_QUERY_LIMIT" _npm_latest npm)"
+  [[ "$latest" =~ $_UUA_VER_RE ]] && latest="$MATCH" || latest=""
 
-  latest="$(_ver_from_log "$log-check.log")"
+  [[ -n "$latest" ]] ||
+    { _step_error "unable to query the registry"; return }
 
-  [[ -n "$current" && -n "$latest" ]] ||
-    { _step_error "npm: unable to detect version"; return }
+  [[ -n "$current" ]] ||
+    { _step_error "unable to detect the installed version"; return }
 
-  _needs_install npm "$current" "$latest" || return 0
+  _needs_install "$current" "$latest" || return 0
 
-  if ! _run_spinner "Updating npm" "$log-install.log" "$_UUA_INSTALL_LIMIT" \
-    npm install -g npm@latest
+  _phase 0.3 0.95 6
+
+  if ! _run_task "updating to $latest" "$log-install.log" "$_UUA_INSTALL_LIMIT" \
+    _with_lock npm npm install -g npm@latest
   then
     # npm@latest can require a newer Node than the active one.
     command -v nvm >/dev/null 2>&1 ||
-      { _step_error "npm: update failed" "$log-install.log"; return }
+      { _step_error "update failed" "$log-install.log"; return }
 
-    _warn "npm@latest rejected; trying the latest compatible version"
+    _sub warn "npm@latest rejected; trying the latest compatible version"
 
-    _run_spinner "Installing latest compatible npm" "$log-compat.log" "$_UUA_INSTALL_LIMIT" \
+    _run_task "installing the latest compatible npm" "$log-compat.log" "$_UUA_INSTALL_LIMIT" \
       nvm install-latest-npm ||
-      { _step_error "npm: update failed" "$log-compat.log"; return }
+      { _step_error "update failed" "$log-compat.log"; return }
 
     note="latest compatible"
   fi
 
   rehash 2>/dev/null
-  _finish_upgrade npm "$current" "$(npm --version 2>/dev/null)" "$note" "$log-install.log"
+  _finish_upgrade "$current" "$(npm --version 2>/dev/null)" "$note" "$log-install.log"
 }
 
 
 # ─────────────────────────────────────────────────────────────
-# 4. Bun
+# Job: Bun
 # ─────────────────────────────────────────────────────────────
 
 _step_bun() {
   local log="$_UUA_RUN_DIR/bun"
   local current latest
 
-  _section "bun"
-
   if ! command -v bun >/dev/null 2>&1; then
-    _absent "bun: not installed"
+    _row absent "not installed"
     return 0
   fi
 
   command -v curl >/dev/null 2>&1 ||
-    { _step_error "bun: curl is needed to check for releases"; return }
+    { _step_error "curl is needed to check for releases"; return }
 
   current="$(_uua_ver bun --version)"
 
-  _run_spinner "Checking latest Bun release" "$log-check.log" "$_UUA_QUERY_LIMIT" \
-    curl -fsSL --max-time 20 --retry 2 -o /dev/null -w '%{url_effective}' \
-      https://github.com/oven-sh/bun/releases/latest ||
-    { _step_error "bun: unable to query the latest release" "$log-check.log"; return }
-
-  latest="$(grep -Eo 'bun-v[0-9]+(\.[0-9]+){1,3}' "$log-check.log" | tail -n 1)"
-  latest="${latest#bun-v}"
+  _phase 0 0.3 1
+  _activity "checking the latest release"
+  latest="$(_fetch bun-latest "$_UUA_QUERY_LIMIT" _bun_latest)"
 
   [[ -n "$current" && -n "$latest" ]] ||
-    { _step_error "bun: unable to detect version" "$log-check.log"; return }
+    { _step_error "unable to detect the version"; return }
 
-  _needs_install bun "$current" "$latest" || return 0
+  _needs_install "$current" "$latest" || return 0
 
-  _run_spinner "Updating Bun" "$log-install.log" "$_UUA_INSTALL_LIMIT" bun upgrade ||
-    { _step_error "bun: update failed" "$log-install.log"; return }
+  _phase 0.3 0.95 5
+  _run_task "updating to $latest" "$log-install.log" "$_UUA_INSTALL_LIMIT" bun upgrade ||
+    { _step_error "update failed" "$log-install.log"; return }
 
   rehash 2>/dev/null
-  _finish_upgrade bun "$current" "$(_uua_ver bun --version)" "" "$log-install.log"
+  _finish_upgrade "$current" "$(_uua_ver bun --version)" "" "$log-install.log"
 }
 
 
 # ─────────────────────────────────────────────────────────────
-# 5. Global packages
+# Jobs: global packages
 # ─────────────────────────────────────────────────────────────
 
 _step_npm_globals() {
-  _section "npm globals"
-
   if ! command -v npm >/dev/null 2>&1; then
-    _absent "npm globals: npm not installed"
+    _row absent "npm not installed"
     return 0
   fi
 
-  _sweep_globals "npm globals" _npm_global_packages "@latest" \
-    _with_npm_lock npm install -g
+  _sweep_globals "npm globals" _npm_global_packages "@latest" npm-g-latest \
+    _with_lock npm npm install -g
 }
 
 
 _step_bun_globals() {
-  _section "bun globals"
-
   if ! command -v bun >/dev/null 2>&1; then
-    _absent "bun globals: bun not installed"
+    _row absent "bun not installed"
     return 0
   fi
 
   if [[ ! -f "$(_bun_global_root)/package.json" ]]; then
-    _absent "bun globals: none installed"
+    _row absent "none installed"
     return 0
   fi
 
-  _sweep_globals "bun globals" _bun_global_packages "" \
-    bun update --latest -g
+  _sweep_globals "bun globals" _bun_global_packages "" bun-g-latest \
+    _with_lock bun bun update --latest -g
 }
 
 
 # ─────────────────────────────────────────────────────────────
-# Parallel CLI workers
+# Jobs: AI CLIs
 # ─────────────────────────────────────────────────────────────
 
 # OpenCode v2's package ships a launcher that its postinstall replaces
@@ -1485,11 +1879,13 @@ _codex_prune() {
 # sweeps off that package, or a function printing the latest release
 # for a tool npm does not publish. Policy "auto" updates through npm
 # when npm owns the executable; "self" always uses the self-updater.
+# Either way the tool's job waits for the job of the package manager
+# that installed it (see _tool_owner), and takes that tree's lock.
 #
 # The extensions updater refreshes the tool's own extension packages
-# (in its own directory, not the global npm tree, so without the npm
-# lock). It runs whenever the tool is runnable, even when the tool is
-# already current, but never in --check mode: there is no dry run.
+# (in its own directory, not a global tree, so without a lock). It runs
+# whenever the tool is runnable, even when the tool is already current,
+# but never in --check mode: there is no dry run.
 #
 # The repair command reinstates an executable a package manager left
 # unrunnable; it runs only when the version cannot be read.
@@ -1511,8 +1907,9 @@ _tool_fields() {
 }
 
 
-# A worker's outcome, "state|current|latest|detail", written under a
-# temporary name and renamed so the reader never sees half a line.
+# A tool's outcome, "state|current|latest|notes" (notes separated by
+# "; "), written under a temporary name and renamed so the reader never
+# sees half a line.
 _write_result() {
   local file="$_UUA_RUN_DIR/$1.result"
 
@@ -1531,6 +1928,9 @@ _extensions_update() {
 
   [[ -n "$2" ]] || return 0
   (( _UUA_CHECK_ONLY )) && return 0
+
+  _phase 0.92 0.99 3
+  _activity "updating extensions" "$log"
 
   if ${=2} </dev/null >"$log" 2>&1; then
     # The updater prints progress lines only when a package actually
@@ -1559,6 +1959,8 @@ _repair_tool() {
   [[ -n "$repair" ]] || return 0
   (( _UUA_CHECK_ONLY )) && return 0
 
+  _phase 0.05 0.1 3
+  _activity "repairing the executable" "$_UUA_RUN_DIR/$key-repair.log"
   ${=repair} </dev/null >>"$_UUA_RUN_DIR/$key-repair.log" 2>&1 || return 0
 
   _uua_ver "$cmd" --version
@@ -1585,6 +1987,9 @@ _worker_tool() {
     return 0
   fi
 
+  _phase 0 0.1 0.5
+  _activity "reading the installed version"
+
   # An install whose postinstall was blocked is already broken before
   # any update runs, so repair it instead of reporting it unreadable.
   current="$(_uua_ver "$cmd" --version)"
@@ -1599,13 +2004,18 @@ _worker_tool() {
     return 0
   fi
 
+  _phase 0.1 0.3 1
+  _activity "checking the latest release"
+
   if _is_apt_managed "$cmd"; then
     # apt owns the executable and has already handled it.
     state=managed
     latest="$current"
     notes+=("managed by apt")
 
-  elif ! latest="$(_latest_version "$version_source")" || [[ -z "$latest" ]]; then
+  elif ! latest="$(_fetch "ai-$key" "$_UUA_QUERY_LIMIT" _latest_version "$version_source")" ||
+    [[ -z "$latest" ]]
+  then
     state=failed
     notes=("unable to detect the latest version")
 
@@ -1617,8 +2027,8 @@ _worker_tool() {
     state=available
 
   else
-    # A "self" tool still takes the lock when npm owns it: its own
-    # updater writes the same global tree.
+    # A "self" tool still takes the lock when a package manager owns it:
+    # its own updater writes the same global tree.
     updater=(${=self_updater})
 
     if _is_npm_managed "$cmd"; then
@@ -1626,8 +2036,13 @@ _worker_tool() {
         updater=(npm install -g "${version_source#npm:}@latest")
       fi
 
-      updater=(_with_npm_lock $updater)
+      updater=(_with_lock npm $updater)
+    elif _is_bun_managed "$cmd"; then
+      updater=(_with_lock bun $updater)
     fi
+
+    _phase 0.3 0.88 8
+    _activity "updating to $latest" "$log"
 
     "${updater[@]}" </dev/null >"$log" 2>&1
     rc=$?
@@ -1661,6 +2076,8 @@ _worker_tool() {
 
   if [[ -n "$prune" && ( "$state" == ok || "$state" == updated ) ]]; then
     if (( _UUA_PRUNE && ! _UUA_CHECK_ONLY )); then
+      _phase 0.88 0.92 1
+      _activity "removing old releases"
       n="$(${=prune} remove)"
       [[ -n "$n" ]] && notes+=("$n old release(s) removed")
     else
@@ -1671,185 +2088,1187 @@ _worker_tool() {
 
   (( runnable )) && _extensions_update "$key" "$extensions"
 
-  _write_result "$key" "$state" "$current" "$latest" "${(j:, :)notes}"
+  _write_result "$key" "$state" "$current" "$latest" "${(j:; :)notes}"
 }
 
 
-# Animates one spinner for the parallel stage until every worker has
-# finished. A worker still running after _UUA_WORKER_LIMIT seconds is
-# stopped, with everything it started, and reported as failed.
-_parallel_wait() {
-  local -a keys=("${(@P)1}")
-  local -a pids=("${(@P)2}")
-  local deadline=$(( SECONDS + _UUA_WORKER_LIMIT ))
-  local finished alive i
-
-  _spin_begin "Parallel CLI updates"
-
-  while true; do
-    finished=0
-    alive=0
-
-    for i in {1..$#keys}; do
-      [[ -e "$_UUA_RUN_DIR/$keys[i].done" ]] && (( finished++ ))
-      kill -0 "$pids[i]" 2>/dev/null && (( alive++ ))
-    done
-
-    # A worker killed before it writes its marker would otherwise keep
-    # this loop spinning forever.
-    (( finished >= $#keys || alive == 0 )) && break
-
-    if (( SECONDS >= deadline )); then
-      for i in {1..$#keys}; do
-        [[ -e "$_UUA_RUN_DIR/$keys[i].done" ]] && continue
-
-        _is_my_child "$pids[i]" && _kill_tree "$pids[i]"
-        _write_result "$keys[i]" failed "" "" \
-          "stopped after ${_UUA_WORKER_LIMIT}s without finishing"
-      done
-
-      break
-    fi
-
-    _spinning &&
-      _spin_frame "Parallel CLI updates  $C_CYAN$finished/$#keys$C_RESET complete"
-
-    _tick
-  done
-
-  _spin_end
-}
-
-
+# Turns a tool's result files into its row and sub-lines.
 _report_tool() {
   local key="$1"
-  local label="$2"
   local file="$_UUA_RUN_DIR/$key.result"
-  local state current latest detail
-  local -a r
+  local state current latest note
+  local -a r notes
 
-  # -s, not -f: a worker killed mid-write leaves nothing to read.
+  # -s, not -f: a job killed mid-write leaves nothing to read.
   [[ -s "$file" ]] && r=("${(@s:|:)$(<"$file")}")
 
-  state="$r[1]" current="$r[2]" latest="$r[3]" detail="$r[4]"
+  state="$r[1]" current="$r[2]" latest="$r[3]"
+  notes=(${(s:; :)r[4]})
 
   case "$state" in
     absent)
-      _absent "$label: not installed"
+      _row absent "not installed"
       ;;
 
     ok)
-      _ok "$label: $current (up to date${detail:+, $detail})"
+      _row ok "$current · up to date"
       _mark_uptodate
       ;;
 
     managed)
-      _ok "$label: $current ($detail)"
+      _row ok "$current · managed by apt"
+      notes=(${notes:#managed by apt})
       _mark_uptodate
       ;;
 
     updated)
-      _ok "$label: $current → $latest (upgraded${detail:+, $detail})"
+      _row updated "$current → $latest · upgraded"
       _mark_updated
       ;;
 
     available)
-      _update "$label: $current → $latest (update available)"
+      _row available "$current → $latest · update available"
       _mark_available
       ;;
 
     failed)
       if [[ -n "$current" && -n "$latest" ]]; then
-        _fail "$label: upgrade failed ($current → $latest, $detail)"
+        _row failed "$notes[1] · $current → $latest"
       else
-        _fail "$label: $detail"
+        _row failed "$notes[1]"
       fi
 
-      _show_log_tail "$_UUA_RUN_DIR/$key.log"
-      _show_log_tail "$_UUA_RUN_DIR/$key-repair.log"
+      shift notes
       _mark_failed
       ;;
 
     "")
-      _fail "$label: worker produced no result"
+      _row failed "no result"
       _mark_failed
       ;;
 
     *)
-      _fail "$label: unknown worker state '$state'"
+      _row failed "unknown state '$state'"
       _mark_failed
       ;;
   esac
+
+  for note in $notes; do
+    _sub note "$note"
+  done
+
+  if [[ "$state" == failed ]]; then
+    _sub_tail "$_UUA_RUN_DIR/$key.log"
+    _sub_tail "$_UUA_RUN_DIR/$key-repair.log"
+  fi
 
   file="$_UUA_RUN_DIR/$key-ext.result"
   [[ -s "$file" ]] || return 0
 
   case "$(<"$file")" in
     updated)
-      _ok "$label extensions: upgraded"
+      _sub updated "extensions upgraded"
       _mark_updated
       ;;
 
     current)
-      _ok "$label extensions: up to date"
+      _sub ok "extensions up to date"
       _mark_uptodate
       ;;
 
     *)
-      _fail "$label extensions: update failed"
-      _show_log_tail "$_UUA_RUN_DIR/$key-extensions.log"
+      _sub failed "extensions update failed"
+      _sub_tail "$_UUA_RUN_DIR/$key-extensions.log"
       _mark_failed
       ;;
   esac
 }
 
 
-_parallel_tools() {
-  local -a keys pids
-  local row pid
-
-  _section "AI CLIs"
-
-  _resolve_npm_root
+# The job for tool $1 of _UUA_TOOLS.
+_job_ai() {
+  local row
+  local -a fields
 
   for row in $_UUA_TOOLS; do
     _tool_fields "$row"
-    keys+=("$reply[1]")
+    [[ "$reply[1]" == "$1" ]] && { fields=("${reply[@]}"); break }
   done
 
-  # The workers' output interleaves, so each line carries its log's
-  # name: "[claude]", "[pi-extensions]".
+  (( $#fields )) || { _step_error "unknown tool $1"; return }
+
   (( _UUA_VERBOSE )) &&
-    _follow_start 1 "$_UUA_RUN_DIR"/${^keys}{.log,-repair.log,-extensions.log}
+    _follow_start "$_UUA_RUN_DIR/$1"{.log,-repair.log,-extensions.log}
 
-  for row in $_UUA_TOOLS; do
-    _tool_fields "$row"
-
-    (
-      _worker_tool "$reply[1]" "${(@)reply[3,9]}"
-      : >"$_UUA_RUN_DIR/$reply[1].done"
-    ) &
-
-    pids+=($!)
-  done
-
-  _UUA_CHILD_PIDS+=($pids)
-
-  _parallel_wait keys pids
-
-  for pid in $pids; do
-    wait "$pid" 2>/dev/null
-    _forget_child "$pid"
-  done
-
+  _worker_tool "$1" "${(@)fields[3,9]}"
   _follow_stop
 
+  _report_tool "$1"
+}
+
+
+# ─────────────────────────────────────────────────────────────
+# Jobs
+# ─────────────────────────────────────────────────────────────
+#
+# The plan is a list of jobs, each with the jobs it waits for. The main
+# shell starts every job whose dependencies are done, in a subshell of
+# its own, and collects it when it finishes: its outcome counts, and the
+# variables it exported for the jobs after it.
+
+typeset -ga _UUA_PLAN
+typeset -gA _UUA_J_NAME _UUA_J_GROUP _UUA_J_DEPS _UUA_J_FUNC _UUA_J_LIMIT \
+  _UUA_J_OWNER _UUA_J_STATE _UUA_J_PID _UUA_J_START _UUA_J_END _UUA_J_ROW \
+  _UUA_J_ACT _UUA_J_LOG _UUA_J_TAIL _UUA_J_TAILAT \
+  _UUA_J_PHASE _UUA_J_PHASEAT _UUA_J_FRAC _UUA_J_PROG
+
+_UUA_T0=0
+_UUA_T_END=0
+_UUA_PLAN_ACTIVE=0
+_UUA_STOPPING=0
+
+
+# Adds job $1 to the plan: shown in group $2 as $3, waiting for the jobs
+# in $4 (space-separated), running command $5 under a limit of $6
+# seconds (0: none).
+_plan_add() {
+  _UUA_PLAN+=("$1")
+  _UUA_J_GROUP[$1]="$2"
+  _UUA_J_NAME[$1]="$3"
+  _UUA_J_DEPS[$1]="$4"
+  _UUA_J_FUNC[$1]="$5"
+  _UUA_J_LIMIT[$1]="${6:-0}"
+  _UUA_J_STATE[$1]=wait
+}
+
+
+_plan_build() {
+  local row key
+
+  _group_enabled _UUA_WANT_APT &&
+    _plan_add apt system apt "" _step_apt 0
+
+  if _group_enabled _UUA_WANT_NODE; then
+    _plan_add node node node "" _step_node
+    _plan_add npm node npm node _step_npm
+    _plan_add npm-g node "npm -g" npm _step_npm_globals
+
+    (( _UUA_PRUNE && ! _UUA_CHECK_ONLY )) &&
+      _plan_add prune node prune "" _step_node_prune
+
+    _plan_add bun bun bun "" _step_bun
+
+    # bun -g looks its packages up with npm, which the node job may
+    # install or switch.
+    _plan_add bun-g bun "bun -g" "bun node" _step_bun_globals
+  fi
+
+  if _group_enabled _UUA_WANT_AI; then
+    for row in $_UUA_TOOLS; do
+      _tool_fields "$row"
+      key="ai-$reply[1]"
+
+      _plan_add "$key" ai "$reply[2]" "" "_job_ai $reply[1]" "$_UUA_WORKER_LIMIT"
+      _tool_owner "$reply[3]"
+      _UUA_J_OWNER[$key]="$REPLY"
+
+      case "$REPLY" in
+        apt|npm|bun) _UUA_J_DEPS[$key]="$REPLY" ;;
+      esac
+    done
+  fi
+
+  # Old Node releases go once nothing can be running one.
+  (( ${+_UUA_J_NAME[prune]} )) &&
+    _UUA_J_DEPS[prune]="${(j: :)${(@)_UUA_PLAN:#prune}}"
+
+  # --check changes nothing, so nothing waits for anything.
+  if (( _UUA_CHECK_ONLY )); then
+    for key in $_UUA_PLAN; do
+      _UUA_J_DEPS[$key]=""
+    done
+  fi
+}
+
+
+# Sends out the queries of every planned job at once.
+_prefetch_all() {
+  local row key
+
+  if (( ${+_UUA_J_NAME[node]} )); then
+    command -v nvm >/dev/null 2>&1 &&
+      _prefetch node-lts "$_UUA_QUERY_LIMIT" _node_lts_remote
+
+    if command -v npm >/dev/null 2>&1; then
+      _prefetch npm-latest "$_UUA_QUERY_LIMIT" _npm_latest npm
+      _prefetch npm-g-latest "$_UUA_INSTALL_LIMIT" _globals_latest _npm_global_packages
+
+      [[ -f "$(_bun_global_root)/package.json" ]] &&
+        _prefetch bun-g-latest "$_UUA_INSTALL_LIMIT" _globals_latest _bun_global_packages
+    fi
+
+    command -v bun >/dev/null 2>&1 &&
+      _prefetch bun-latest "$_UUA_QUERY_LIMIT" _bun_latest
+  fi
+
   for row in $_UUA_TOOLS; do
     _tool_fields "$row"
-    _report_tool "$reply[1]" "$reply[2]"
+    key="ai-$reply[1]"
+
+    (( ${+_UUA_J_NAME[$key]} )) || continue
+    [[ "$_UUA_J_OWNER[$key]" == (absent|apt) ]] && continue
+
+    _prefetch "$key" "$_UUA_QUERY_LIMIT" _latest_version "$reply[4]"
+  done
+}
+
+
+# A job signalled by anything but the main shell (which stops the whole
+# tree itself) takes what it started with it, rather than leave npm or
+# curl running without a parent. Not APT: dpkg must not be cut off.
+_job_abort() {
+  local pid
+
+  _children "$sysparams[pid]"
+
+  for pid in $reply; do
+    _kill_tree "$pid"
   done
 
+  exit 143
+}
+
+
+_job_spawn() {
+  local key="$1"
+
+  (
+    [[ "$key" == apt ]] || trap '_job_abort' TERM HUP
+
+    _UUA_JOB="$key"
+    _UUA_UPTODATE=0 _UUA_UPDATED=0 _UUA_AVAILABLE=0 _UUA_FAILED_STEPS=0
+    _UUA_NODE_CHANGED=0 _UUA_REBOOT=0
+    _UUA_CHILD_PIDS=() _UUA_FOLLOW=() _UUA_PHASE=()
+
+    ${=_UUA_J_FUNC[$key]} >>"$_UUA_JOB_DIR/$key.stray" 2>&1
+
+    print -r -- "$_UUA_UPTODATE $_UUA_UPDATED $_UUA_AVAILABLE $_UUA_FAILED_STEPS" \
+      "$_UUA_NODE_CHANGED $_UUA_REBOOT" >"$_UUA_JOB_DIR/$key.counts"
+    : >"$_UUA_JOB_DIR/$key.done"
+  ) </dev/null &
+
+  _UUA_J_PID[$key]="$!"
+  _UUA_J_START[$key]="$EPOCHREALTIME"
+  _UUA_J_STATE[$key]=run
+  _UUA_CHILD_PIDS+=($!)
+}
+
+
+# Starts every waiting job whose dependencies are done. A dependency
+# that is not in the plan (a filtered-out group) counts as done.
+_plan_spawn() {
+  local key dep ready
+
+  (( _UUA_STOPPING )) && return 0
+
+  for key in $_UUA_PLAN; do
+    [[ "$_UUA_J_STATE[$key]" == wait ]] || continue
+
+    ready=1
+
+    for dep in ${=_UUA_J_DEPS[$key]}; do
+      if [[ -n "$_UUA_J_STATE[$dep]" && "$_UUA_J_STATE[$dep]" != done ]]; then
+        ready=0
+        break
+      fi
+    done
+
+    (( ready )) && _job_spawn "$key"
+  done
+}
+
+
+# Collects the jobs that finished and stops those past their limit.
+# True when any job finished.
+_plan_poll() {
+  local key pid limit finished=1
+
+  for key in $_UUA_PLAN; do
+    [[ "$_UUA_J_STATE[$key]" == run ]] || continue
+
+    pid="$_UUA_J_PID[$key]"
+    limit="$_UUA_J_LIMIT[$key]"
+
+    if [[ -e "$_UUA_JOB_DIR/$key.done" ]] || ! kill -0 "$pid" 2>/dev/null; then
+      _job_finish "$key"
+      finished=0
+    elif (( limit > 0 && EPOCHREALTIME - _UUA_J_START[$key] >= limit )); then
+      _is_my_child "$pid" && _kill_tree "$pid"
+      _job_finish "$key" "stopped after ${limit}s without finishing"
+      finished=0
+    fi
+  done
+
+  return "$finished"
+}
+
+
+# Collects job $1. A job that ends without its .done marker was stopped
+# ($2 says why) or died; its row says so, with the tail of the log it
+# was writing.
+_job_finish() {
+  local key="$1"
+  local reason="${2:-}"
+  local f="$_UUA_JOB_DIR/$1"
+  local act log line
+  local -a counts
+
+  wait "$_UUA_J_PID[$key]" 2>/dev/null
+  _forget_child "$_UUA_J_PID[$key]"
+
+  _UUA_J_END[$key]="$EPOCHREALTIME"
+  _UUA_J_STATE[$key]=done
+  _UUA_J_PROG[$key]=1
+
+  if [[ -z "$reason" && -e "$f.done" ]]; then
+    counts=(${=$(<"$f.counts")})
+
+    (( _UUA_UPTODATE += counts[1] ))
+    (( _UUA_UPDATED += counts[2] ))
+    (( _UUA_AVAILABLE += counts[3] ))
+    (( _UUA_FAILED_STEPS += counts[4] ))
+    (( counts[5] )) && _UUA_NODE_CHANGED=1
+    (( counts[6] )) && _UUA_REBOOT=1
+
+    if [[ -s "$f.env" ]]; then
+      source "$f.env"
+      rehash 2>/dev/null
+    fi
+
+    if [[ -s "$f.row" ]]; then
+      _UUA_J_ROW[$key]="$(<"$f.row")"
+    else
+      _UUA_J_ROW[$key]="failed|no result"
+      _mark_failed
+    fi
+  else
+    if [[ -z "$reason" ]]; then
+      if (( _UUA_STOPPING )); then
+        reason="interrupted"
+      else
+        reason="ended without a result"
+      fi
+    fi
+
+    _UUA_J_ROW[$key]="failed|$reason"
+    (( _UUA_STOPPING )) || _mark_failed
+
+    if (( ! _UUA_VERBOSE )) && [[ -s "$f.act" ]]; then
+      act="$(<"$f.act")"
+      log="${${(@ps:\t:)act}[2]}"
+
+      if [[ -n "$log" ]]; then
+        for line in "${(@f)$(tail -q -n 8 -- "$log" "$log.err" 2>/dev/null)}"; do
+          [[ -n "$line" ]] && print -r -- "tail|$line" >>"$f.sub"
+        done
+      fi
+    fi
+  fi
+
+  (( _UUA_LIVE )) || _print_job "$key"
+}
+
+
+_plan_all_done() {
+  local key
+
+  for key in $_UUA_PLAN; do
+    [[ "$_UUA_J_STATE[$key]" == done ]] || return 1
+  done
+}
+
+
+# With nothing running, a job still waiting can never start: it waits
+# for itself, in a circle. It fails rather than hang the run.
+_plan_unstick() {
+  local key
+
+  for key in $_UUA_PLAN; do
+    [[ "$_UUA_J_STATE[$key]" == run ]] && return 0
+  done
+
+  for key in $_UUA_PLAN; do
+    [[ "$_UUA_J_STATE[$key]" == wait ]] || continue
+
+    _UUA_J_STATE[$key]=done
+    _UUA_J_START[$key]="$EPOCHREALTIME"
+    _UUA_J_END[$key]="$EPOCHREALTIME"
+    _UUA_J_ROW[$key]="failed|waits for itself: ${_UUA_J_DEPS[$key]}"
+    _mark_failed
+    (( _UUA_LIVE )) || _print_job "$key"
+  done
+}
+
+
+_plan_run() {
+  _UUA_PLAN_ACTIVE=1
+  _UUA_T0="$EPOCHREALTIME"
+
+  _board_begin
+
+  while true; do
+    _plan_spawn
+
+    # A finished job may have freed others: start them without waiting
+    # for the next tick.
+    while _plan_poll; do
+      _plan_spawn
+    done
+
+    _plan_all_done && break
+    _plan_unstick
+
+    _board_draw
+    _tick
+  done
+
+  _UUA_T_END="$EPOCHREALTIME"
+  _board_end
+  _UUA_PLAN_ACTIVE=0
+}
+
+
+# Ctrl-C or a signal: every job is stopped with what it started, except
+# APT, which gets the SIGINT it would have got in the foreground (it
+# ignores it while dpkg runs) and is waited for. The board shows what
+# was cut off.
+_plan_stop() {
+  local key pid
+  local -a killers
+
+  _UUA_STOPPING=1
+  : >"$_UUA_JOB_DIR/.stop"
+
+  for key in $_UUA_PLAN; do
+    [[ "$_UUA_J_STATE[$key]" == run ]] || continue
+
+    pid="$_UUA_J_PID[$key]"
+    _is_my_child "$pid" || continue
+
+    if [[ "$key" == apt ]]; then
+      _signal_tree INT "$pid"
+    else
+      _kill_tree "$pid" &
+      killers+=($!)
+    fi
+  done
+
+  for key in $_UUA_PLAN; do
+    if [[ "$_UUA_J_STATE[$key]" == wait ]]; then
+      _UUA_J_STATE[$key]=done
+      _UUA_J_START[$key]="$EPOCHREALTIME"
+      _UUA_J_END[$key]="$EPOCHREALTIME"
+      _UUA_J_ROW[$key]="absent|not started"
+    fi
+  done
+
+  until _plan_all_done; do
+    _plan_poll
+    _board_draw
+    _tick
+  done
+
+  (( $#killers )) && wait $killers 2>/dev/null
+
+  _UUA_T_END="$EPOCHREALTIME"
+  _board_end
+  _UUA_PLAN_ACTIVE=0
+
+  print
+}
+
+
+# ─────────────────────────────────────────────────────────────
+# Board
+# ─────────────────────────────────────────────────────────────
+#
+# On a terminal the plan is a live board, redrawn in place a dozen
+# times a second: a row per job with its state, what it is doing and the
+# latest line of its log, a progress bar in its group's color and its
+# time, under a bar for the whole run. The last frame stays, with each
+# job's details under its row. Anywhere else each job prints once, when
+# it finishes.
+
+_UUA_LIVE=0
+_UUA_DRAWN=0
+_UUA_TICK=0
+_UUA_COLS=80
+_UUA_LINES=24
+_UUA_STREAM_FD=0
+_UUA_STREAM_BUF=""
+
+# The progress bars' line, and the terminal's settings to restore.
+_UUA_LINE="━"
+_UUA_STTY=""
+_UUA_PROBED_LATE=0
+
+_UUA_FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+
+
+_term_size() {
+  local -a size
+
+  size=(${=$(stty size </dev/tty 2>/dev/null)})
+
+  if (( $#size == 2 && size[1] > 0 && size[2] > 0 )); then
+    _UUA_LINES=$size[1]
+    _UUA_COLS=$size[2]
+  elif (( ${LINES:-0} > 0 && ${COLUMNS:-0} > 0 )); then
+    _UUA_LINES=$LINES
+    _UUA_COLS=$COLUMNS
+  fi
+}
+
+
+# $1 repeated $2 times, into REPLY.
+_rep() {
+  local e=""
+
+  if (( $2 > 0 )); then
+    REPLY="${(pl:$2::$1:)e}"
+  else
+    REPLY=""
+  fi
+}
+
+
+# $1 cut or padded to exactly $2 columns, into REPLY. Widths are the
+# ones the system reports, so a log line in Chinese is cut right too.
+_fit() {
+  local s="$1"
+  local -i w="$2" n
+
+  if (( w <= 0 )); then
+    REPLY=""
+    return
+  fi
+
+  n=${(m)#s}
+
+  if (( n > w )); then
+    s="${s[1,w]}"
+
+    while (( ${(m)#s} > w - 1 )); do
+      s="${s[1,-2]}"
+    done
+
+    REPLY="$s…"
+  else
+    _rep " " $(( w - n ))
+    REPLY="$s$REPLY"
+  fi
+}
+
+
+# Seconds $1 as "0.4s", "12.3s", "1m05s" or "1h02m", into REPLY.
+_fmt_secs() {
+  local -F t="$1"
+  local -i m
+
+  if (( t < 60 )); then
+    printf -v REPLY '%.1fs' "$t"
+  elif (( t < 3600 )); then
+    (( m = t / 60 ))
+    printf -v REPLY '%dm%02ds' "$m" "$(( int(t) % 60 ))"
+  else
+    (( m = t / 60 ))
+    printf -v REPLY '%dh%02dm' "$(( m / 60 ))" "$(( m % 60 ))"
+  fi
+}
+
+
+# A progress bar $2 columns wide with $1 (0 to 1) of it done, into
+# REPLY: a line in color $3 over a faint one of the same length. A job
+# that has started shows at least a little of it, and one that has not
+# finished never looks done. Without colors it is "=" over "-".
+_pbar() {
+  local -F f="$1"
+  local -i w="$2" n
+  local done
+
+  (( f < 0 )) && f=0
+  (( f > 1 )) && f=1
+  (( n = f * w + 0.5 ))
+  (( f > 0 && n == 0 )) && n=1
+  (( f < 1 && n >= w && w > 1 )) && (( n = w - 1 ))
+
+  if [[ -n "$C_RESET" ]]; then
+    _rep "$_UUA_LINE" "$n"
+    done="$REPLY"
+    _rep "$_UUA_LINE" "$(( w - n ))"
+    REPLY="$3$done$_UUA_GC[track]$REPLY$C_RESET"
+  else
+    _rep = "$n"
+    done="$REPLY"
+    _rep - "$(( w - n ))"
+    REPLY="$done$REPLY"
+  fi
+}
+
+
+# The names of the jobs job $1 still waits for, into REPLY.
+_deps_pending() {
+  local dep
+  local -a names
+
+  for dep in ${=_UUA_J_DEPS[$1]}; do
+    [[ -n "$_UUA_J_STATE[$dep]" && "$_UUA_J_STATE[$dep]" != done ]] &&
+      names+=("$_UUA_J_NAME[$dep]")
+  done
+
+  if (( $#names > 3 )); then
+    REPLY="$#names jobs"
+  else
+    REPLY="${(j:, :)names}"
+  fi
+}
+
+
+# The last non-blank line of file $1, stripped of escape sequences and
+# control characters, into REPLY. Only its end is read; progress output
+# that redraws with carriage returns counts from its last redraw.
+_last_log_line() {
+  setopt localoptions extendedglob
+  local chunk fd
+  local -a st lines
+
+  REPLY=""
+  zstat -A st +size -- "$1" 2>/dev/null || return 1
+  (( st[1] > 0 )) || return 1
+
+  exec {fd}<"$1" || return 1
+  (( st[1] > 2048 )) && sysseek -u "$fd" $(( st[1] - 2048 ))
+  sysread -i "$fd" -s 2048 chunk
+  exec {fd}<&-
+
+  lines=(${(f)${chunk//$'\r'/$'\n'}})
+  lines=(${lines:#[[:space:]]#})
+  (( $#lines )) || return 1
+
+  REPLY="${lines[-1]//$'\e'\[[0-9;?]#[@-~]/}"
+  REPLY="${REPLY//[[:cntrl:]]/}"
+  REPLY="${${REPLY##[[:space:]]#}%%[[:space:]]#}"
+
+  [[ -n "$REPLY" ]]
+}
+
+
+# Refreshes what running job $1 is doing and how far it has got. Its
+# current phase (see _phase) covers a share of its progress bar; the
+# part of it done is counted from the log (lines matching the phase's
+# pattern, or a percentage the command printed last) and otherwise eased
+# in over time. The bar only ever grows, and fills when the job is done.
+# The log's latest line, and the count, are read a few times a second.
+_job_watch() {
+  local key="$1"
+  local f="$_UUA_JOB_DIR/$1.act"
+  local act log pat
+  local -a a m1 m2 lines
+  local -F now=$EPOCHREALTIME p0 p1 tau frac eased cand
+  local -i total
+
+  [[ -s "$f" ]] && act="$(<"$f")"
+  [[ -n "$act" ]] && _UUA_J_ACT[$key]="$act"
+
+  a=("${(@ps:\t:)_UUA_J_ACT[$key]}")
+  log="$a[2]" p0="${a[3]:-0}" p1="${a[4]:-0.9}" tau="${a[5]:-3}" pat="$a[6]" total="${a[7]:-0}"
+  (( tau < 0.1 )) && tau=0.1
+
+  # A new log: its latest line is not the old one. A new phase: the
+  # count and the easing start over.
+  if [[ "$log" != "$_UUA_J_LOG[$key]" ]]; then
+    _UUA_J_LOG[$key]="$log"
+    _UUA_J_TAIL[$key]=""
+    _UUA_J_TAILAT[$key]=0
+  fi
+
+  if [[ "$p0 $p1" != "$_UUA_J_PHASE[$key]" ]]; then
+    _UUA_J_PHASE[$key]="$p0 $p1"
+    _UUA_J_PHASEAT[$key]="$now"
+    _UUA_J_FRAC[$key]=-1
+  fi
+
+  if (( now - ${_UUA_J_TAILAT[$key]:-0} >= 0.25 )) && [[ -n "$log" ]]; then
+    _UUA_J_TAILAT[$key]="$now"
+
+    zstat -A m1 +mtime -- "$log" 2>/dev/null || m1=(0)
+    zstat -A m2 +mtime -- "$log.err" 2>/dev/null || m2=(0)
+
+    if (( m2[1] > m1[1] )) && _last_log_line "$log.err"; then
+      :
+    elif _last_log_line "$log" || _last_log_line "$log.err"; then
+      :
+    fi
+
+    _UUA_J_TAIL[$key]="$REPLY"
+
+    # (Floats go into the array as strings: assigned in arithmetic,
+    # zsh would round them away.)
+    if [[ -n "$pat" ]] && (( total > 0 )); then
+      [[ -s "$log" ]] && lines=("${(@f)$(<"$log")}")
+      lines=(${(M)lines:#${(b)pat}*})
+      (( frac = $#lines / (total * 1.0) ))
+      _UUA_J_FRAC[$key]="$frac"
+    elif [[ "$REPLY" =~ '([0-9]+(\.[0-9]+)?)%' ]] && (( match[1] <= 100 )); then
+      (( frac = match[1] / 100.0 ))
+      _UUA_J_FRAC[$key]="$frac"
+    fi
+  fi
+
+  (( eased = 1 - exp(-(now - _UUA_J_PHASEAT[$key]) / tau) ))
+  frac="$_UUA_J_FRAC[$key]"
+
+  # While a count stands still (downloads before the first package is
+  # set up), time still moves the bar, if more slowly.
+  if (( frac >= 0 )); then
+    (( frac < eased / 2 )) && (( frac = eased / 2 ))
+    (( frac > 1 )) && frac=1
+  else
+    frac=$eased
+  fi
+
+  (( cand = p0 + (p1 - p0) * frac ))
+  (( cand > 0.99 )) && cand=0.99
+  (( cand > ${_UUA_J_PROG[$key]:-0} )) && _UUA_J_PROG[$key]="$cand"
+
   return 0
+}
+
+
+# The board's lines into reply; $1 is 1 for the last frame, which
+# shows every row with its sub-lines.
+_board_lines() {
+  local final="$1"
+  local -a out keys pri subs
+  local -A show
+  local key st rs rt icon color name text label tail line pre
+  local group prev="" times bar gc
+
+  # Each column starts at its own column number too (CHA), so a
+  # character the terminal draws wider than expected cannot push the
+  # ones after it out of line.
+  local at=$'\e['
+  local -i W gut=0 nam=13 tim=7 pb=0 txt ind i n ndone=0 avail bw
+  local e0=""
+
+  setopt localoptions extendedglob
+  local -F now=$EPOCHREALTIME t0=$_UUA_T0 tmax progress=0
+
+  (( tmax = final ? _UUA_T_END : now ))
+
+  # Columns: group, mark, name, text, progress bar, time. The narrower
+  # the terminal, the fewer of them.
+  (( W = _UUA_COLS - 1 ))
+  (( W > 119 )) && W=119
+  (( W >= 60 )) && gut=8
+
+  if (( W >= 70 )); then
+    (( pb = W / 5 ))
+    (( pb < 10 )) && pb=10
+    (( pb > 28 )) && pb=28
+  fi
+
+  # The mark gets two columns: "↑" is one of the characters some
+  # terminals draw two wide.
+  (( txt = W - gut - 3 - nam - tim - (pb ? pb + 2 : 0) ))
+  (( ind = gut + 3 + nam ))
+
+  # How far each job has got; the run's progress is their average.
+  for key in $_UUA_PLAN; do
+    case "$_UUA_J_STATE[$key]" in
+      run)
+        _job_watch "$key"
+        (( progress += ${_UUA_J_PROG[$key]:-0} ))
+        ;;
+
+      done)
+        (( ndone++ ))
+        (( progress += 1 ))
+        ;;
+    esac
+  done
+
+  (( $#_UUA_PLAN )) && (( progress /= $#_UUA_PLAN ))
+
+  # The header: a mark, the run's progress bar and the time so far.
+  gc="$_UUA_GC[total]"
+
+  if (( final )); then
+    if (( _UUA_INTERRUPTED )); then
+      icon="$C_RED✗$C_RESET" gc="$_UUA_GC[failed]"
+    elif (( _UUA_FAILED_STEPS )); then
+      icon="$C_YELLOW⚠$C_RESET"
+    else
+      icon="$C_GREEN✓$C_RESET"
+    fi
+  else
+    icon="$C_CYAN$_UUA_FRAMES[$(( _UUA_TICK % $#_UUA_FRAMES + 1 ))]$C_RESET"
+  fi
+
+  _fmt_secs $(( tmax - t0 ))
+  times="  $ndone/$#_UUA_PLAN  $REPLY"
+  (( bw = W - 9 - ${#UUA_VERSION} - ${#times} ))
+  (( bw < 4 )) && bw=4
+  _pbar "$progress" "$bw" "$gc"
+
+  out+=($'\e[?7l'" $icon ${C_BOLD}UUA$C_RESET $C_DIM$UUA_VERSION$C_RESET  $REPLY$C_BOLD$times$C_RESET" "")
+
+  # A terminal too short for every row shows the running ones first,
+  # then failures, then the waiting ones.
+  keys=($_UUA_PLAN)
+  (( avail = _UUA_LINES - 3 - $#out ))
+
+  if (( ! final && $#keys > avail )); then
+    i=0
+
+    for key in $_UUA_PLAN; do
+      (( i++ ))
+
+      case "$_UUA_J_STATE[$key]:${_UUA_J_ROW[$key]%%|*}" in
+        run:*)       n=0 ;;
+        done:failed) n=1 ;;
+        wait:*)      n=2 ;;
+        *)           n=3 ;;
+      esac
+
+      pri+=("$n:${(l:3::0:)i}:$key")
+    done
+
+    for line in ${${(o)pri}[1,avail-1]}; do
+      show[${line##*:}]=1
+    done
+
+    keys=()
+
+    for key in $_UUA_PLAN; do
+      (( ${+show[$key]} )) && keys+=("$key")
+    done
+  fi
+
+  i=0
+
+  for key in $keys; do
+    (( i++ ))
+
+    st="$_UUA_J_STATE[$key]"
+    group="$_UUA_J_GROUP[$key]"
+    gc="$_UUA_GC[$group]"
+    pre=""
+
+    if (( gut )); then
+      if [[ "$group" != "$prev" ]]; then
+        pre=" ${gc:-$C_DIM}${(r:6:)${(U)group}}$C_RESET "
+      else
+        pre="        "
+      fi
+    fi
+
+    prev="$group"
+    _fit "$_UUA_J_NAME[$key]" $(( nam - 1 ))
+    name="$REPLY "
+    times=""
+
+    case "$st" in
+      wait)
+        icon="$C_DIM$_UUA_ICON[wait]$C_RESET"
+        name="$C_DIM$name$C_RESET"
+        _deps_pending "$key"
+        _fit "waiting${REPLY:+ for $REPLY}" "$txt"
+        text="$C_DIM$REPLY$C_RESET"
+        _pbar 0 "$pb" "$gc"
+        bar="$REPLY"
+        ;;
+
+      run)
+        (( n = (_UUA_TICK + i) % $#_UUA_FRAMES + 1 ))
+        icon="$C_MAGENTA$_UUA_FRAMES[n]$C_RESET"
+        name="$C_BOLD$name$C_RESET"
+
+        label="${_UUA_J_ACT[$key]%%$'\t'*}"
+        [[ -n "$label" ]] || label="starting"
+        (( _UUA_STOPPING )) && label="finishing safely · $label"
+        tail="$_UUA_J_TAIL[$key]"
+
+        if (( ${(m)#label} >= txt || ${#tail} == 0 || txt - ${(m)#label} < 8 )); then
+          _fit "$label" "$txt"
+          text="$REPLY"
+        else
+          _fit "  $tail" $(( txt - ${(m)#label} ))
+          text="$label$C_DIM$REPLY$C_RESET"
+        fi
+
+        _pbar "${_UUA_J_PROG[$key]:-0}" "$pb" "$gc"
+        bar="$REPLY"
+        _fmt_secs $(( now - _UUA_J_START[$key] ))
+        times="$REPLY"
+        ;;
+
+      *)
+        rs="${_UUA_J_ROW[$key]%%|*}"
+        rt="${_UUA_J_ROW[$key]#*|}"
+
+        _state_color "$rs"
+        color="$REPLY"
+        icon="$color$_UUA_ICON[$rs]$C_RESET"
+
+        _fit "$rt" "$txt"
+
+        case "$rs" in
+          ok)     text="$REPLY" ;;
+          absent) text="$C_DIM$REPLY$C_RESET" name="$C_DIM$name$C_RESET" ;;
+          *)      text="$color$REPLY$C_RESET" ;;
+        esac
+
+        if [[ "$rs" == absent ]]; then
+          _rep " " "$pb"
+          bar="$REPLY"
+        else
+          [[ "$rs" == failed ]] && gc="$_UUA_GC[failed]"
+          _pbar 1 "$pb" "$gc"
+          bar="$REPLY"
+          _fmt_secs $(( _UUA_J_END[$key] - _UUA_J_START[$key] ))
+          times="$C_DIM$REPLY$C_RESET"
+        fi
+        ;;
+    esac
+
+    # Rows never wrap, not even in the last frame; sub-lines may.
+    line=$'\e[?7l'"${at}1G$pre$at$(( gut + 1 ))G$icon  $at$(( gut + 4 ))G$name$at$(( ind + 1 ))G$text"
+    (( pb )) && line+="  $at$(( ind + txt + 3 ))G$bar"
+
+    _fit "" $(( tim - ${#${times//$'\e'\[[0-9;]#m/}} ))
+    out+=("$line$at$(( W - tim + 1 ))G$REPLY$times")
+
+    if (( final )) && [[ -s "$_UUA_JOB_DIR/$key.sub" ]]; then
+      subs=("${(@f)$(<"$_UUA_JOB_DIR/$key.sub")}")
+
+      for line in $subs; do
+        _fmt_line "${line%%|*}" "${line#*|}"
+        out+=($'\e[?7h'"${(l:ind:: :)e0}$at$(( ind + 1 ))G$REPLY")
+      done
+    fi
+  done
+
+  (( $#keys < $#_UUA_PLAN )) &&
+    out+=("$C_DIM${(l:ind:: :)e0}$at$(( ind + 1 ))G… $(( $#_UUA_PLAN - $#keys )) more$C_RESET")
+
+  reply=("${out[@]}")
+}
+
+
+# New complete lines of the --verbose stream, into reply.
+_stream_take() {
+  local chunk line complete
+
+  reply=()
+  [[ -n "$_UUA_STREAM" ]] || return 0
+
+  if (( ! _UUA_STREAM_FD )); then
+    [[ -r "$_UUA_STREAM" ]] || return 0
+    exec {_UUA_STREAM_FD}<"$_UUA_STREAM"
+  fi
+
+  while sysread -i "$_UUA_STREAM_FD" -s 65536 chunk; do
+    _UUA_STREAM_BUF+="$chunk"
+  done
+
+  [[ "$_UUA_STREAM_BUF" == *$'\n'* ]] || return 0
+
+  complete="${_UUA_STREAM_BUF%$'\n'*}"
+  _UUA_STREAM_BUF="${_UUA_STREAM_BUF##*$'\n'}"
+
+  for line in "${(@f)complete}"; do
+    reply+=("${line##*$'\r'}")
+  done
+}
+
+
+# True when the terminal draws East Asian ambiguous-width characters,
+# "━" among them, two columns wide, as many CJK setups do: it is asked
+# where the cursor went after drawing one ("ESC [ row ; col R"). The
+# terminal must be in non-canonical mode. The answer is read a byte at a
+# time against a deadline (read -t only waits for the first byte, then
+# blocks), so a key pressed meanwhile cannot hang the run. A terminal
+# that does not answer in time counts as narrow; its answer may still
+# come, and _tty_restore swallows it.
+_ambiguous_wide() {
+  local reply="" c
+  local -F deadline
+
+  printf '\r━\033[6n' >/dev/tty
+  (( deadline = EPOCHREALTIME + 0.5 ))
+
+  while (( EPOCHREALTIME < deadline )); do
+    IFS= read -r -s -k 1 -t 0.05 c </dev/tty || continue
+    reply+="$c"
+    [[ "$c" == R ]] && break
+  done
+
+  printf '\r\033[2K' >/dev/tty
+
+  if [[ "$reply" != *$'\e['*\;*R ]]; then
+    _UUA_PROBED_LATE=1
+    return 1
+  fi
+
+  reply="${reply%R}"
+  [[ "${reply##*;}" == 3 ]]
+}
+
+
+# Puts the terminal back as it was, first swallowing a late answer to
+# _ambiguous_wide, which would otherwise land in the shell's input.
+_tty_restore() {
+  local c
+
+  [[ -n "$_UUA_STTY" ]] || return 0
+
+  if (( _UUA_PROBED_LATE )); then
+    for c in {1..64}; do
+      IFS= read -r -s -k 1 -t 0.1 c </dev/tty || break
+    done
+  fi
+
+  stty "$_UUA_STTY" </dev/tty 2>/dev/null
+  _UUA_STTY=""
+}
+
+
+_board_begin() {
+  if [[ -t 1 && "$TERM" != dumb ]]; then
+    _UUA_LIVE=1
+    _term_size
+    trap '_term_size' WINCH
+
+    # Keys typed while the board runs are not echoed over it.
+    _UUA_STTY="$(stty -g </dev/tty 2>/dev/null)"
+
+    if [[ -n "$_UUA_STTY" ]] && stty -echo -icanon </dev/tty 2>/dev/null; then
+      _ambiguous_wide && _UUA_LINE="-"
+    fi
+
+    # No autowrap while the board redraws: a row wider than the
+    # terminal thinks it is is cut at the edge rather than wrapped,
+    # which would throw every redraw after it out of place.
+    printf '\n\033[?25l\033[?7l'
+  else
+    _UUA_LIVE=0
+    print -r -- "${C_BOLD}UUA $UUA_VERSION$C_RESET $C_DIM· $#_UUA_PLAN jobs$C_RESET"
+  fi
+}
+
+
+# Redraws the board over its last frame. --verbose lines go above it and
+# scroll away; the board stays at the bottom.
+_board_draw() {
+  local out="" line
+  local -a stream
+
+  (( _UUA_TICK++ ))
+
+  _stream_take
+  stream=("${reply[@]}")
+
+  if (( ! _UUA_LIVE )); then
+    (( $#stream )) && print -rl -- "${stream[@]}"
+    return 0
+  fi
+
+  _board_lines 0
+
+  (( _UUA_DRAWN )) && out+=$'\e['"${_UUA_DRAWN}A"
+  out+=$'\r'
+
+  # The stream wraps like any output: it scrolls away above the board.
+  if (( $#stream )); then
+    out+=$'\e[J\e[?7h'
+
+    for line in "${stream[@]}"; do
+      out+="$line"$'\n'
+    done
+
+    out+=$'\e[?7l'
+  fi
+
+  for line in "${reply[@]}"; do
+    out+=$'\e[2K'"$line"$'\n'
+  done
+
+  out+=$'\e[J'
+  printf '%s' "$out"
+
+  _UUA_DRAWN=$#reply
+}
+
+
+# The last frame, or for a run without a board the rest of the stream.
+_board_end() {
+  local out="" line
+  local -a stream
+
+  _stream_take
+  stream=("${reply[@]}")
+
+  if (( ! _UUA_LIVE )); then
+    (( $#stream )) && print -rl -- "${stream[@]}"
+    return 0
+  fi
+
+  trap - WINCH
+  _board_lines 1
+
+  # The last frame stays, so its sub-lines may wrap.
+  (( _UUA_DRAWN )) && out+=$'\e['"${_UUA_DRAWN}A"
+  out+=$'\r\e[J\e[?7h'
+
+  for line in "${stream[@]}" "${reply[@]}"; do
+    out+="$line"$'\n'
+  done
+
+  printf '%s\033[?7h\033[?25h' "$out"
+  _tty_restore
+
+  _UUA_LIVE=0
+  _UUA_DRAWN=0
+}
+
+
+# A finished job for a run without a board: its row, time and
+# sub-lines.
+_print_job() {
+  local key="$1"
+  local rs="${_UUA_J_ROW[$1]%%|*}"
+  local rt="${_UUA_J_ROW[$1]#*|}"
+  local line
+  local -F took
+
+  _fmt_line "$rs" "${(r:12:)_UUA_J_NAME[$key]} $rt"
+  line="$REPLY"
+
+  if [[ "$rs" != absent ]]; then
+    (( took = _UUA_J_END[$key] - _UUA_J_START[$key] ))
+    _fmt_secs "$took"
+    line+="  $C_DIM($REPLY)$C_RESET"
+  fi
+
+  print -r -- "$line"
+
+  [[ -s "$_UUA_JOB_DIR/$key.sub" ]] || return 0
+
+  for line in "${(@f)$(<"$_UUA_JOB_DIR/$key.sub")}"; do
+    _fmt_line "${line%%|*}" "${line#*|}"
+    print -r -- "               $REPLY"
+  done
 }
 
 
@@ -1890,7 +3309,9 @@ _cleanup() {
   # the cleanup short and leave children running.
   trap '' INT TERM HUP
 
-  # Workers and commands write into the run directory, so they (and
+  (( _UUA_PLAN_ACTIVE )) && _plan_stop
+
+  # Jobs and queries write into the run directory, so they (and
   # whatever they started) have to be gone before it is removed.
   for pid in $_UUA_CHILD_PIDS $_UUA_SUDO_REFRESH_PID; do
     _is_my_child "$pid" && _kill_tree "$pid"
@@ -1903,7 +3324,9 @@ _cleanup() {
   _UUA_CHILD_PIDS=()
   _UUA_SUDO_REFRESH_PID=""
 
-  [[ -t 2 ]] && printf '\r\033[2K\033[?25h' >&2
+  [[ -t 1 ]] && printf '\033[?25h\033[?7h'
+  _tty_restore
+  (( _UUA_STREAM_FD )) && exec {_UUA_STREAM_FD}<&-
 
   _release_run_lock
   _finish_logs
@@ -1952,9 +3375,9 @@ Options:
   --node        Only the Node.js group: node, npm, bun and the global
                 npm/bun packages
   --ai          Only the AI CLI group
-  --verbose     Show the output of every command as it runs, instead of
-                a spinner; the AI CLIs' lines are prefixed with the
-                log they come from ("[claude]", "[pi-extensions]")
+  --verbose     Show the output of every command as it runs, each line
+                prefixed with the log it comes from ("[npm-install]",
+                "[claude]"); on a terminal the board stays below it
   --keep-logs   Keep this run's logs (kept anyway when anything fails)
   --no-color    Disable colors (so does NO_COLOR)
   --version     Print the version
@@ -1964,10 +3387,26 @@ Group flags combine ("uua --apt --ai"); without one every group runs.
 The sudo password is asked for once, before anything runs, and only
 when the APT group runs outside --check.
 
-Pipeline:
-  apt → node → npm → bun → npm globals → bun globals → AI CLIs
+How it runs:
+  Every step is a job, and a job starts as soon as the ones it builds
+  on have finished:
+    apt
+    node → npm → npm globals
+    bun → bun globals (after node too: it looks packages up with npm)
+    AI CLIs (${(j:, :)labels}): from the start when they
+      update themselves; after apt, npm or bun when that package
+      manager installed them
+  With --prune, old Node.js releases are removed last. --check changes
+  nothing, so every job starts at once. The registry and release
+  queries all go out first, while the sudo password is typed.
 
-AI CLIs, updated in parallel: ${(j:, :)labels}
+  On a terminal a live board shows each job's state, what it is doing
+  and the latest line of its log, and a progress bar in the color of its
+  group (apt, node, bun, AI CLIs), under a bar for the whole run; the
+  last frame stays, with the details. Elsewhere each job prints once,
+  when it finishes.
+
+AI CLIs:
   A tool whose executable apt owns is left to apt. Pi's extension
   packages are refreshed with "pi update --extensions" whenever pi is
   installed; --check skips them, as pi has no dry run.
@@ -1976,13 +3415,13 @@ Node.js:
   Installs the latest LTS through nvm. The default alias moves to
   lts/* only when it is unset, dangling, or names the exact release
   being replaced; a pin ("22", "lts/iron", "system", ...) stays, and
-  the later steps then update the pinned Node, the one new shells get.
+  the later jobs then update the pinned Node, the one new shells get.
   nvm itself is not updated: it has no self-update command.
 
 Global packages:
   Every npm -g and bun -g package installed from a registry, except
-  the ones the steps above own. Linked, local and git packages are
-  left alone.
+  the ones the jobs above own. Linked, local and git packages are left
+  alone.
 
 Removal:
   Nothing is removed without --prune; without it, uua reports what
@@ -1990,7 +3429,8 @@ Removal:
 
 Time limits:
   ${_UUA_QUERY_LIMIT}s per version query, $(( _UUA_INSTALL_LIMIT / 60 ))min per install, $(( _UUA_WORKER_LIMIT / 60 ))min per AI CLI. APT has
-  none: dpkg must not be killed halfway through.
+  none: dpkg must not be killed halfway through, and Ctrl-C waits for
+  it to finish.
 
 Logs:
   $_UUA_LOG_ROOT/run-<time>-<pid>
@@ -2021,24 +3461,42 @@ _group_enabled() {
 
 
 _summary() {
-  local elapsed="$1"
-  local total=$(( _UUA_UPTODATE + _UUA_UPDATED + _UUA_AVAILABLE + _UUA_FAILED_STEPS ))
+  local key line speed
+  local -i total ran=0
+  local -F wall work=0
 
-  printf '\n'
+  (( total = _UUA_UPTODATE + _UUA_UPDATED + _UUA_AVAILABLE + _UUA_FAILED_STEPS ))
+  (( wall = _UUA_T_END - _UUA_T0 ))
 
-  if (( _UUA_FAILED_STEPS == 0 )); then
-    printf '%s✓ UUA finished%s %s(%ds)%s\n' "$C_GREEN" "$C_RESET" "$C_DIM" "$elapsed" "$C_RESET"
-  else
-    printf '%s⚠ UUA finished%s %s(%ds)%s\n' "$C_YELLOW" "$C_RESET" "$C_DIM" "$elapsed" "$C_RESET"
-  fi
+  for key in $_UUA_PLAN; do
+    [[ "${_UUA_J_ROW[$key]%%|*}" == absent ]] && continue
 
-  printf '%sSummary:%s %d item(s)\n' "$C_BOLD" "$C_RESET" "$total"
-  printf '  %s✓%s %-17s %d\n' "$C_GREEN" "$C_RESET" "up to date" "$_UUA_UPTODATE"
-  printf '  %s↑%s %-17s %d\n' "$C_YELLOW" "$C_RESET" "upgraded" "$_UUA_UPDATED"
-  printf '  %s✗%s %-17s %d\n' "$C_RED" "$C_RESET" "failed" "$_UUA_FAILED_STEPS"
+    (( work += _UUA_J_END[$key] - _UUA_J_START[$key] ))
+    (( ran++ ))
+  done
+
+  line=" ${C_BOLD}Summary$C_RESET  $total item(s)"
+  line+="  $C_GREEN✓$C_RESET $_UUA_UPTODATE up to date"
+  line+="  $C_CYAN↑$C_RESET $_UUA_UPDATED upgraded"
+  line+="  $C_RED✗$C_RESET $_UUA_FAILED_STEPS failed"
 
   (( _UUA_AVAILABLE )) &&
-    printf '  %s→%s %-17s %d\n' "$C_CYAN" "$C_RESET" "update available" "$_UUA_AVAILABLE"
+    line+="  $C_YELLOW↑$C_RESET $_UUA_AVAILABLE update(s) available"
+
+  printf '\n%s\n' "$line"
+
+  _fmt_secs "$wall"
+  line=" ${C_BOLD}Time$C_RESET     $REPLY"
+
+  # How much the jobs overlapped: their running times added up, against
+  # the time the run took.
+  if (( ran > 1 && wall >= 0.5 )); then
+    _fmt_secs "$work"
+    printf -v speed '%.1f' $(( work / wall ))
+    line+="  $C_DIM·  $REPLY of work in $ran jobs, ${speed}× in parallel$C_RESET"
+  fi
+
+  print -r -- "$line"
 
   if (( _UUA_NODE_CHANGED )); then
     printf '\n'
@@ -2056,7 +3514,6 @@ _summary() {
 
 
 main() {
-  local started=$SECONDS
   local stamp
 
   while (( $# > 0 )); do
@@ -2111,40 +3568,46 @@ main() {
   strftime -s stamp '%Y%m%d-%H%M%S' "$EPOCHSECONDS"
   _UUA_RUN_DIR="$_UUA_LOG_ROOT/run-$stamp-$$"
 
-  if ! mkdir -m 700 "$_UUA_RUN_DIR"; then
+  if ! mkdir -m 700 "$_UUA_RUN_DIR" ||
+    ! mkdir "$_UUA_RUN_DIR/jobs" "$_UUA_RUN_DIR/cache"
+  then
+    _fail "Unable to create the log directory $_UUA_RUN_DIR"
     _UUA_RUN_DIR=""
-    _fail "Unable to create the log directory $_UUA_LOG_ROOT/run-$stamp-$$"
     return 1
   fi
 
-  # Collect the sudo password first, while the terminal is quiet and no
-  # spinner can hide the prompt. --check never needs root, and neither
-  # does a run without the apt group.
+  _UUA_JOB_DIR="$_UUA_RUN_DIR/jobs"
+  _UUA_CACHE="$_UUA_RUN_DIR/cache"
+
+  if (( _UUA_VERBOSE )); then
+    _UUA_STREAM="$_UUA_RUN_DIR/verbose.log"
+    : >"$_UUA_STREAM"
+  fi
+
+  # Every job works on the Node new shells get, nvm's default, from the
+  # start: the node job hands on a newer one when it installs it. The
+  # invoking shell's own is remembered, for the note that it changed.
+  if _group_enabled _UUA_WANT_NODE || _group_enabled _UUA_WANT_AI; then
+    if _load_nvm; then
+      _UUA_ACTIVE_NODE="$(_strip_v "$(nvm current 2>/dev/null)")"
+      _use_default_node
+    fi
+
+    _resolve_npm_root
+  fi
+
+  _plan_build
+  _prefetch_all
+
+  # The sudo password comes before the board, while no redraw can hide
+  # the prompt; the queries above are already out. --check never needs
+  # root, and neither does a run without the apt group.
   if (( ! _UUA_CHECK_ONLY )) && _group_enabled _UUA_WANT_APT; then
     _collect_sudo_password || return 1
   fi
 
-  if _group_enabled _UUA_WANT_APT; then
-    _step_apt
-  fi
-
-  if _group_enabled _UUA_WANT_NODE; then
-    _step_node
-    _step_npm
-    _step_bun
-
-    # Global trees are swept before the CLI workers so nothing writes
-    # them concurrently.
-    _step_npm_globals
-    _step_bun_globals
-  fi
-
-  if _group_enabled _UUA_WANT_AI; then
-    _group_enabled _UUA_WANT_NODE || _use_default_node
-    _parallel_tools
-  fi
-
-  _summary $(( SECONDS - started ))
+  _plan_run
+  _summary
 
   (( _UUA_FAILED_STEPS )) && return 1
   (( _UUA_CHECK_ONLY && _UUA_AVAILABLE )) && return 100
