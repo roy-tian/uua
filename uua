@@ -244,11 +244,16 @@ _phase() {
 
 # What the job is doing now ($1), and the log its progress shows up in
 # ($2): the board shows the log's latest line beside it. The current
-# _phase goes along.
+# _phase goes along. The board reads the file while the job runs, and a
+# file rewritten in place can be read torn (the new line, then the tail
+# of the old one), so the line is written aside and renamed into place.
 _activity() {
+  local f="$_UUA_JOB_DIR/$_UUA_JOB.act"
+
   [[ -n "$_UUA_JOB" ]] || return 0
 
-  print -r -- "$1"$'\t'"${2:-}"$'\t'"${(pj:\t:)_UUA_PHASE}" >|"$_UUA_JOB_DIR/$_UUA_JOB.act"
+  print -r -- "$1"$'\t'"${2:-}"$'\t'"${(pj:\t:)_UUA_PHASE}" >|"$f.tmp" &&
+    mv -f -- "$f.tmp" "$f"
 }
 
 
@@ -2778,7 +2783,13 @@ _job_watch() {
   local -i total
 
   [[ -s "$f" ]] && act="$(<"$f")"
-  [[ -n "$act" ]] && _UUA_J_ACT[$key]="$act"
+
+  # Its numbers go into arithmetic, where anything else is fatal to the
+  # whole run; a line that is not one the job wrote is passed over.
+  if [[ -n "$act" ]]; then
+    a=("${(@ps:\t:)act}")
+    [[ "${(j::)a[3,5]}$a[7]" != *[^0-9.]* ]] && _UUA_J_ACT[$key]="$act"
+  fi
 
   a=("${(@ps:\t:)_UUA_J_ACT[$key]}")
   log="$a[2]" p0="${a[3]:-0}" p1="${a[4]:-0.9}" tau="${a[5]:-3}" pat="$a[6]" total="${a[7]:-0}"

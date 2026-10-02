@@ -422,6 +422,22 @@ sleep 0.6
 _job_watch slow
 expect "progress: eased in over time" 1 "$(( _UUA_J_PROG[slow] > 0.45 && _UUA_J_PROG[slow] <= 0.5 ))"
 
+# A torn read (the new line, then the tail of a longer old one) once
+# put part of a path into arithmetic and ended the run.
+watch torn "one"$'\t\t0.5\t0.6\t100\t\t0' >/dev/null
+print -r -- "two"$'\t\t0\t0.3\t1\t\t0\nuua/run-20261002/claude.log\t0.3\t0.88\t8\t\t0' \
+  >"$_UUA_JOB_DIR/torn.act"
+expect "progress: a torn line passed over" one \
+  "$(_job_watch torn 2>&1; print -r -- "${_UUA_J_ACT[torn]%%$'\t'*}")"
+
+(
+  _UUA_JOB=act _UUA_PHASE=(0.1 0.2 3 "" 0)
+  _activity "doing" "$TMP/act.log"
+)
+expect "activity: the whole line" "doing"$'\t'"$TMP/act.log"$'\t0.1\t0.2\t3\t\t0' \
+  "$(<"$_UUA_JOB_DIR/act.act")"
+expect "activity: no temporary file left" no "$([[ -e "$_UUA_JOB_DIR/act.act.tmp" ]] && print yes || print no)"
+
 for t in 0.04:0.0s 12.34:12.3s 65.2:1m05s 3725:1h02m; do
   _fmt_secs "${t%%:*}"
   expect "time: ${t%%:*}" "${t#*:}" "$REPLY"
