@@ -616,8 +616,8 @@ expect "lock: released" no "$([[ -e "$_UUA_RUN_LOCK" ]] && print yes || print no
 
 # ── Command line ────────────────────────────────────────────
 
-expect "cli: version" "UUA 0.1.1" "$(zsh "$ROOT/uua" --version)"
-expect "cli: --verbose accepted" "UUA 0.1.1" "$(zsh "$ROOT/uua" --verbose --version)"
+expect "cli: version" "UUA 0.1.2" "$(zsh "$ROOT/uua" --version)"
+expect "cli: --verbose accepted" "UUA 0.1.2" "$(zsh "$ROOT/uua" --verbose --version)"
 
 zsh "$ROOT/uua" --bogus 2>/dev/null
 expect "cli: unknown option" 2 $?

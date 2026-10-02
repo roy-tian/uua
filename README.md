@@ -35,7 +35,7 @@ line in each group's color (apt, node, bun, AI CLIs, and the run) over a
 faint one; without colors, as here midway through a run, "=" over "-":
 
 ```
- ⠴ UUA 0.1.1  =================================================--------------------  6/11  3.5s
+ ⠴ UUA 0.1.2  =================================================--------------------  6/11  3.5s
 
  SYSTEM ⠦  apt          installing 12 update(s)  Unpacking libfake…  ==========---------   3.0s
  NODE   ↑  node         22.0.0 → 24.1.0 · upgraded                   ===================   1.6s

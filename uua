@@ -19,7 +19,7 @@
 # is doing and how far it has got. `uua --help` is the reference for the
 # options, what gets removed, and exit status.
 
-UUA_VERSION="0.1.1"
+UUA_VERSION="0.1.2"
 
 autoload -Uz is-at-least
 zmodload zsh/datetime
