@@ -54,9 +54,11 @@ _UUA_UPDATED=0
 _UUA_AVAILABLE=0
 _UUA_FAILED_STEPS=0
 
-# Notes printed after the summary
+# Notes printed after the summary, and the file packages write to ask
+# for a reboot.
 _UUA_NODE_CHANGED=0
 _UUA_REBOOT=0
+_UUA_REBOOT_FLAG=/var/run/reboot-required
 
 # Run state
 _UUA_LOG_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/uua"
@@ -1276,6 +1278,17 @@ _apt_unused() {
 }
 
 
+# When the reboot flag was last written, into REPLY; empty when there is
+# none. Packages write it afresh each time they ask for a reboot, and it
+# stays until the next boot.
+_reboot_stamp() {
+  local -a st
+
+  REPLY=""
+  zstat -F '%s.%N' -A st +mtime -- "$_UUA_REBOOT_FLAG" 2>/dev/null && REPLY="$st[1]"
+}
+
+
 # Runs both simulations side by side (they only read), into the
 # variables named $1 (upgrades pending) and $2 (packages nothing needs).
 _apt_simulate() {
@@ -1315,7 +1328,7 @@ _apt_prune() {
 
 _step_apt() {
   local log="$_UUA_RUN_DIR/apt"
-  local pending left unused=0 note=""
+  local pending left stamp unused=0 note=""
 
   if ! command -v apt-get >/dev/null 2>&1; then
     _row absent "not available on this system"
@@ -1338,7 +1351,6 @@ _step_apt() {
     fi
 
     _apt_prune "" "$unused"
-    [[ -f /var/run/reboot-required ]] && _UUA_REBOOT=1
 
     return 0
   fi
@@ -1350,6 +1362,11 @@ _step_apt() {
   # then are a failure rather than an invisible prompt.
   sudo -n true 2>/dev/null ||
     { _step_error "sudo credentials expired (re-run uua)"; return }
+
+  # A flag an earlier upgrade left is not this run's to report, only one
+  # written while this job changed packages.
+  _reboot_stamp
+  stamp="$REPLY"
 
   _phase 0 0.3 4
   _run_task "refreshing package metadata" "$log-update.log" 0 _sudo_apt update ||
@@ -1389,7 +1406,9 @@ _step_apt() {
   fi
 
   _apt_prune "$log-autoremove.log" "$unused"
-  [[ -f /var/run/reboot-required ]] && _UUA_REBOOT=1
+
+  _reboot_stamp
+  [[ -n "$REPLY" && "$REPLY" != "$stamp" ]] && _UUA_REBOOT=1
 
   return 0
 }

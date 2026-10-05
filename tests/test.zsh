@@ -592,6 +592,49 @@ out="$(
 expect "verbose: job output labelled" yes "$(has "$out" "   [fake] fake updater says hi")"
 expect "verbose: job still reported" yes "$(has "$out" "Fake         1.0.0 → 2.0.0 · upgraded")"
 
+# The APT job asks for a reboot only when its own upgrade wrote the
+# flag, not for one an earlier upgrade left behind.
+stub sudo '[ "$1" = -n ] && shift; [ "$1" = true ] && exit 0; exec "$@"'
+stub apt-get "case \" \$* \" in
+  *' -s upgrade '*) [ -e $TMP/apt-pending ] && echo 'Inst libfake (1.1)' ;;
+  *' upgrade '*)
+    rm -f $TMP/apt-pending
+    [ -e $TMP/apt-wants-reboot ] && echo '*** System restart required ***' >$TMP/reboot-required ;;
+esac
+exit 0"
+
+apt_reboot() {
+  _UUA_REBOOT_FLAG="$TMP/reboot-required"
+  _UUA_REBOOT=0
+  reset_plan
+  _plan_add apt system apt "" _step_apt 0
+  _plan_run >/dev/null
+  print -r -- "$_UUA_REBOOT $_UUA_J_ROW[apt]"
+}
+
+old_flag() {
+  touch -d '2 days ago' "$TMP/reboot-required"
+}
+
+rm -f "$TMP/reboot-required" "$TMP/apt-wants-reboot"
+touch "$TMP/apt-pending"
+expect "reboot: none asked for" "0 updated|1 package(s) upgraded" "$(apt_reboot)"
+
+old_flag
+touch "$TMP/apt-pending"
+expect "reboot: an earlier upgrade's flag" "0 updated|1 package(s) upgraded" "$(apt_reboot)"
+expect "reboot: nothing to upgrade" "0 ok|up to date" "$(apt_reboot)"
+expect "reboot: not in check mode" "0 ok|up to date · metadata not refreshed" \
+  "$(_UUA_CHECK_ONLY=1; apt_reboot)"
+
+touch "$TMP/apt-pending" "$TMP/apt-wants-reboot"
+expect "reboot: asked for by this upgrade" "1 updated|1 package(s) upgraded" "$(apt_reboot)"
+
+touch "$TMP/apt-pending"
+expect "reboot: in the summary" yes "$(has "$(apt_reboot >/dev/null; _summary)" "A reboot is required")"
+expect "reboot: not in the next run's" no "$(has "$(apt_reboot >/dev/null; _summary)" "A reboot is required")"
+rm -f "$TMP/bin/apt-get" "$TMP/bin/sudo"
+
 
 # ── Run lock ────────────────────────────────────────────────
 
