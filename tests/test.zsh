@@ -570,10 +570,10 @@ _UUA_J_STATE[w]=done _UUA_J_ROW[w]="absent|not installed"
 _UUA_J_START[w]=$_UUA_T_END _UUA_J_END[w]=$_UUA_T_END
 _UUA_COLS=100
 _board_lines 1
-expect "board: the header" yes "$(has "$reply[1]" " ✓ UUA $UUA_VERSION  ==")"
+expect "board: the header" yes "$(has "$reply[1]" " ✓ UUA  ==")"
 expect "board: sub-lines in the last frame" yes "$(has "$(plain $reply)" "· a sub-line")"
 expect "board: a full bar when done" yes "$(has "$(plain $reply)" "…  ===================  ")"
-expect "board: the run's bar" yes "$(has "$(plain $reply[1])" " ✓ UUA $UUA_VERSION  ===")"
+expect "board: the run's bar" yes "$(has "$(plain $reply[1])" " ✓ UUA  ===")"
 
 # The AI CLI jobs, with the updater's output streamed under --verbose.
 print 1.0.0 >"$TMP/fake-version"
@@ -774,6 +774,7 @@ fake_run() {
 F="$TMP/fake"
 out="$(fake_run "$F" FAKE_SPEED=0.1 zsh "$ROOT/uua" --prune)"
 expect "run: succeeds" 0 $?
+expect "run: the header, without the version" "UUA · 11 jobs" "${${(f)out}[1]}"
 
 mods="$F/home/.nvm/versions/node/v24.1.0/lib/node_modules"
 expect "run: every tool upgraded" "0 1.2.0 2.1.0 1.0.0 10.2.0 5.1.0" \

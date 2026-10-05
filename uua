@@ -2947,11 +2947,11 @@ _board_lines() {
 
   _fmt_secs $(( tmax - t0 ))
   times="  $ndone/$#_UUA_PLAN  $REPLY"
-  (( bw = W - 9 - ${#UUA_VERSION} - ${#times} ))
+  (( bw = W - 8 - ${#times} ))
   (( bw < 4 )) && bw=4
   _pbar "$progress" "$bw" "$gc"
 
-  out+=($'\e[?7l'" $icon ${C_BOLD}UUA$C_RESET $C_DIM$UUA_VERSION$C_RESET  $REPLY$C_BOLD$times$C_RESET" "")
+  out+=($'\e[?7l'" $icon ${C_BOLD}UUA$C_RESET  $REPLY$C_BOLD$times$C_RESET" "")
 
   # A terminal too short for every row shows the running ones first,
   # then failures, then the waiting ones.
@@ -3193,7 +3193,7 @@ _board_begin() {
     printf '\n\033[?25l\033[?7l'
   else
     _UUA_LIVE=0
-    print -r -- "${C_BOLD}UUA $UUA_VERSION$C_RESET $C_DIM· $#_UUA_PLAN jobs$C_RESET"
+    print -r -- "${C_BOLD}UUA$C_RESET $C_DIM· $#_UUA_PLAN jobs$C_RESET"
   fi
 }
 
