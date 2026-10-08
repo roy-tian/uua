@@ -659,8 +659,8 @@ expect "lock: released" no "$([[ -e "$_UUA_RUN_LOCK" ]] && print yes || print no
 
 # ── Command line ────────────────────────────────────────────
 
-expect "cli: version" "UUA 0.1.3" "$(zsh "$ROOT/uua" --version)"
-expect "cli: --verbose accepted" "UUA 0.1.3" "$(zsh "$ROOT/uua" --verbose --version)"
+expect "cli: version" "UUA 0.1.4" "$(zsh "$ROOT/uua" --version)"
+expect "cli: --verbose accepted" "UUA 0.1.4" "$(zsh "$ROOT/uua" --verbose --version)"
 
 zsh "$ROOT/uua" --bogus 2>/dev/null
 expect "cli: unknown option" 2 $?
@@ -800,9 +800,10 @@ expect "run: prune last"          prune "$order[-1]"
 expect "run: jobs overlapped" yes \
   "$([[ "$out" =~ '([0-9.]+)× in parallel' ]] && (( match[1] > 1.5 )) && print yes)"
 
-# Stopped halfway: every job is stopped at once but APT, which finishes
-# the command it is running and starts nothing more.
+# Stopped halfway: model APT's protected dpkg phase by ignoring INT.
+# It must finish the command it is running and start nothing more.
 fake_build "$F"
+sed -i "2i trap '' INT" "$F/bin/apt-get"
 env -i $fake_env FAKE_SPEED=0.5 zsh "$ROOT/uua" >"$TMP/stopped.out" &
 main=$!
 
@@ -821,6 +822,62 @@ expect "stop: jobs interrupted" yes "$(has "$out" "✗ Claude Code  interrupted"
 expect "stop: the update not finished" 2.0.0 "$(<"$F/db/claude")"
 expect "stop: APT started nothing more" yes "$(has "$out" "· not started: installing 12 update(s)")"
 expect "stop: nothing left running" "" "$(pgrep -f "$F/")"
+
+# A real terminal Ctrl-C must cancel a pending APT download. A POSIX
+# shell, like sudo/apt, preserves an inherited ignored SIGINT; the INT
+# trap below only works if uua resets that disposition before exec.
+if zmodload zsh/zpty 2>/dev/null; then
+  fake_build "$F"
+  cat >"$F/bin/apt-get" <<'EOF'
+#!/bin/sh
+case " $* " in
+  *" update "*)
+    trap 'echo interrupted >"$HOME/apt-interrupted"; exit 130' INT
+    echo "$$" >"$HOME/apt-pid"
+    echo 'Downloading packages'
+    while [ ! -e "$HOME/release" ]; do sleep 0.05; done
+    ;;
+  *) echo started >"$HOME/apt-next" ;;
+esac
+EOF
+
+  # The outer shell catches INT so it can report uua's exit status.
+  zpty -b interrupt "trap - EXIT; trap ':' INT; stty cols 100 rows 30; env -i ${(j: :)${(@q)fake_env}} TERM=xterm zsh ${(q)ROOT}/uua --apt; print EXIT:\$?"
+  all="" sent=0 completed=0
+  started=$EPOCHREALTIME
+
+  while (( EPOCHREALTIME - started < 8 )); do
+    if zpty -r interrupt out; then
+      all+="$out"
+      [[ "$all" == *EXIT:* ]] && { completed=1; break }
+    fi
+    if (( ! sent )) && [[ -s "$F/home/apt-pid" ]]; then
+      zpty -w -n interrupt $'\x03'
+      sent=1
+    fi
+    sleep 0.02
+  done
+
+  expect "Ctrl-C: reached the download" 1 "$sent"
+  expect "Ctrl-C: exits without finishing the download" 1 "$completed"
+  expect "Ctrl-C: exit status" yes "$(has "$all" 'EXIT:130')"
+  expect "Ctrl-C: APT received INT" yes "$([[ -e "$F/home/apt-interrupted" ]] && print yes || print no)"
+  expect "Ctrl-C: APT started nothing more" no "$([[ -e "$F/home/apt-next" ]] && print yes || print no)"
+  expect "Ctrl-C: terminal restored" yes "$(has "$all" $'\e[?25h\e[?7h')"
+
+  # Release the fixture even on failure so the test cannot leave a
+  # blocked download behind, then drain the terminal before closing it.
+  : >"$F/home/release"
+  started=$EPOCHREALTIME
+  while (( ! completed && EPOCHREALTIME - started < 5 )); do
+    if zpty -r interrupt out; then
+      [[ "$out" == *EXIT:* ]] && completed=1
+    fi
+    sleep 0.02
+  done
+  zpty -d interrupt
+  expect "Ctrl-C: nothing left running" "" "$(pgrep -f "$F/")"
+fi
 
 # --verbose on a terminal: the commands' output scrolls above the board.
 if command -v script >/dev/null 2>&1; then

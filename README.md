@@ -98,8 +98,10 @@ Group flags combine (`uua --apt --ai`). sudo is asked for once, up front,
 and only when the APT group runs. Every item ends up up to date, upgraded
 or failed, and the summary counts them. `uua --help` has the details.
 
-Ctrl-C stops every job at once, except APT: it finishes the command it is
-running (dpkg must not be cut off halfway) and starts nothing more.
+Ctrl-C stops every job, including APT downloads. If APT is already
+running dpkg, uua waits for it to stop safely and starts nothing more.
+The board keeps a stop notice visible while waiting for APT/dpkg;
+without a terminal, the notice is printed once.
 
 ### What gets removed
 
@@ -122,6 +124,7 @@ updated in the pinned Node, the one new shells get.
 | 1    | something failed, or another uua run is in progress |
 | 2    | invalid option |
 | 100  | `--check` found updates |
+| 130  | interrupted with Ctrl-C |
 
 ### Logs
 

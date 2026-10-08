@@ -19,7 +19,7 @@
 # is doing and how far it has got. `uua --help` is the reference for the
 # options, what gets removed, and exit status.
 
-UUA_VERSION="0.1.3"
+UUA_VERSION="0.1.4"
 
 autoload -Uz is-at-least
 zmodload zsh/datetime
@@ -1254,7 +1254,10 @@ _collect_sudo_password() {
 # prompt. The lock timeout waits out unattended-upgrades instead of
 # failing on its lock.
 _sudo_apt() {
-  sudo -n env \
+  # Background jobs inherit SIGINT ignored. Reset it before sudo so
+  # Ctrl-C can cancel downloads; APT installs its own handler while
+  # dpkg runs and remains responsible for stopping that phase safely.
+  env --default-signal=INT sudo -n env \
     DEBIAN_FRONTEND=noninteractive \
     NEEDRESTART_MODE=a \
     apt-get -y \
@@ -2562,6 +2565,15 @@ _plan_run() {
 }
 
 
+_stop_message() {
+  if [[ "$_UUA_J_STATE[apt]" == run ]]; then
+    REPLY="Stop requested; waiting for APT/dpkg to finish safely."
+  else
+    REPLY="Stop requested; stopping running jobs."
+  fi
+}
+
+
 # Ctrl-C or a signal: every job is stopped with what it started, except
 # APT, which gets the SIGINT it would have got in the foreground (it
 # ignores it while dpkg runs) and is waited for. The board shows what
@@ -2572,6 +2584,15 @@ _plan_stop() {
 
   _UUA_STOPPING=1
   : >"$_UUA_JOB_DIR/.stop"
+
+  # Acknowledge before cleanup can wait on APT. Keep the notice in the
+  # live header on every redraw; without a board, print it once.
+  if (( _UUA_LIVE )); then
+    _board_draw
+  else
+    _stop_message
+    _warn "$REPLY"
+  fi
 
   for key in $_UUA_PLAN; do
     [[ "$_UUA_J_STATE[$key]" == run ]] || continue
@@ -2952,6 +2973,12 @@ _board_lines() {
   _pbar "$progress" "$bw" "$gc"
 
   out+=($'\e[?7l'" $icon ${C_BOLD}UUA$C_RESET  $REPLY$C_BOLD$times$C_RESET" "")
+
+  if (( _UUA_STOPPING && ! final )); then
+    _stop_message
+    _fit "$REPLY" $(( W - 1 ))
+    out[2]=" $C_YELLOW$REPLY$C_RESET"
+  fi
 
   # A terminal too short for every row shows the running ones first,
   # then failures, then the waiting ones.
@@ -3459,8 +3486,8 @@ Removal:
 
 Time limits:
   ${_UUA_QUERY_LIMIT}s per version query, $(( _UUA_INSTALL_LIMIT / 60 ))min per install, $(( _UUA_WORKER_LIMIT / 60 ))min per AI CLI. APT has
-  none: dpkg must not be killed halfway through, and Ctrl-C waits for
-  it to finish.
+  none: Ctrl-C cancels downloads, but waits for dpkg to stop safely
+  if installation has already started.
 
 Logs:
   $_UUA_LOG_ROOT/run-<time>-<pid>
@@ -3472,6 +3499,7 @@ Exit status:
   1    something failed, or another run is in progress
   2    invalid option
   100  --check found updates
+  130  interrupted with Ctrl-C
 EOF
 }
 
