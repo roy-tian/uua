@@ -72,13 +72,40 @@ macOS is not supported.
 
 ## Install
 
+On Linux, run this as your normal user (not with `sudo`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/roy-tian/uua/master/install.sh | sh
+```
+
+The installer downloads the latest `master` version to `~/.local/bin/uua`,
+validates it before replacing an existing installation, and adds a PATH
+entry to `.bashrc` for Bash, `${ZDOTDIR:-$HOME}/.zshrc` for Zsh (resolved after
+loading `.zshenv`, even when `ZDOTDIR` is not exported), or `.profile`
+for other shells. Open a new terminal afterward, or run
+`~/.local/bin/uua --check` immediately. Shells that do not read these files
+(such as Fish) need their own PATH configuration.
+
+On Debian/Ubuntu it installs missing `zsh`, `curl`, `flock` and `timeout`
+dependencies through APT, requesting sudo only when needed. On other Linux
+distributions it reports the missing packages for you to install. It does
+not install Node.js, Bun or AI CLIs, and does not run UUA's update pipeline.
+The command above needs `curl` already installed; alternatively, download
+[`install.sh`](install.sh) with your browser and run `sh install.sh`.
+As with any downloaded installer, review the script before running it.
+
+**Upgrade UUA:** run the same installer command again. **Uninstall:**
+`rm ~/.local/bin/uua` (the shared PATH entry is left in place).
+
+### From a checkout
+
 ```sh
 make install     # copies ./uua to ~/.local/bin/uua
 make uninstall
 ```
 
 Make sure `~/.local/bin` is on your `PATH`. `PREFIX=/usr/local make install`
-installs elsewhere.
+installs elsewhere. To upgrade, run `git pull --ff-only && make install`.
 
 ## Usage
 
@@ -136,8 +163,8 @@ Each run logs to `~/.local/state/uua/run-<time>-<pid>/` (under
 
 ```sh
 make link        # symlink ./uua into ~/.local/bin, so edits apply at once
-make check       # zsh -n syntax check + --version
-make test        # tests against stub commands (no network, no sudo)
+make check       # shell syntax checks + --version
+make test        # uua and installer tests against stubs (no network, no sudo)
 make demo        # the live board on a fake system; SPEED=0.5 halves pauses
 ```
 

@@ -9,11 +9,14 @@ SPEED ?= 1
 # Syntax-check the script without running it.
 check:
 	zsh -n $(SCRIPT)
+	sh -n install.sh
+	sh -n tests/install.sh
 	$(SCRIPT) --version
 
 # Unit and command-line tests against stub commands; no network or sudo.
 test: check
 	zsh tests/test.zsh
+	sh tests/install.sh
 
 # A full run with the live board, against a fake system built by
 # tests/fakesys.zsh in a temporary directory: nothing real is updated.
