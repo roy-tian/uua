@@ -145,6 +145,9 @@ case "$url" in
   */codex/channels/latest)
     nap 0.6
     printf '{"tag_name": "rust-v%s"}\n' "$(cat @F@/latest/codex)" ;;
+  */claude-code-releases/latest)
+    nap 0.6
+    cat @F@/latest/@anthropic-ai/claude-code ;;
   *)
     exit 22 ;;
 esac

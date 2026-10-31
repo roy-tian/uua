@@ -704,6 +704,37 @@ _codex_latest() {
 }
 
 
+# Claude Code's native installer reads its own release channel ("latest"
+# unless settings.json picks "stable"), and the npm publish runs ahead
+# of it: "claude update" then says it is up to date while the registry
+# has a newer release. The host is slow and drops requests from some
+# networks (curl's own --retry skips timeouts and resets on older
+# versions), so a failed attempt is made again.
+_claude_latest() {
+  local settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+  local channel=latest
+  local v try
+
+  command -v curl >/dev/null 2>&1 || return 1
+
+  grep -Eq '"autoUpdatesChannel"[[:space:]]*:[[:space:]]*"stable"' "$settings" 2>/dev/null &&
+    channel=stable
+
+  for try in 1 2 3; do
+    v="$(
+      curl -fsSL --max-time 15 \
+        "https://downloads.claude.ai/claude-code-releases/$channel" 2>/dev/null |
+        grep -Eo "^${_UUA_VER_RE}[[:space:]]*\$" |
+        head -n 1
+    )"
+
+    [[ -n "$v" ]] && { print -r -- "$v"; return 0 }
+  done
+
+  return 1
+}
+
+
 # The latest Bun release, from where GitHub's "latest" link redirects.
 _bun_latest() {
   local tag
@@ -745,14 +776,23 @@ _node_lts_remote() {
 
 
 # The latest release for a version source: "npm:<package>" or the name
-# of a function that prints it.
+# of a function that prints it. A tool whose own installer owns the
+# executable (command $3) takes the native source $2 instead, when it
+# has one: that installer follows a release channel of its own.
 _latest_version() {
-  [[ -n "$1" ]] || return 1
+  local src="$1"
 
-  if [[ "$1" == npm:* ]]; then
-    _npm_latest "${1#npm:}"
+  [[ -n "$src" ]] || return 1
+
+  if [[ -n "$2" ]]; then
+    _tool_owner "$3"
+    [[ "$REPLY" == native ]] && src="$2"
+  fi
+
+  if [[ "$src" == npm:* ]]; then
+    _npm_latest "${src#npm:}"
   else
-    ${=1}
+    ${=src}
   fi
 }
 
@@ -1900,7 +1940,7 @@ _codex_prune() {
 
 
 # key | label | command | version source | update policy | self-updater
-#     | extensions updater | repair | prune
+#     | extensions updater | repair | prune | native version source
 #
 # The version source is "npm:<package>", which also keeps the global
 # sweeps off that package, or a function printing the latest release
@@ -1908,6 +1948,12 @@ _codex_prune() {
 # when npm owns the executable; "self" always uses the self-updater.
 # Either way the tool's job waits for the job of the package manager
 # that installed it (see _tool_owner), and takes that tree's lock.
+#
+# The native version source is a function printing the latest release
+# of the channel the tool's own installer follows. It stands in for the
+# version source when no package manager owns the executable: the
+# registry can carry a release that channel does not offer yet, and
+# the self-updater would then rightly stay where it is.
 #
 # The extensions updater refreshes the tool's own extension packages
 # (in its own directory, not a global tree, so without a lock). It runs
@@ -1920,10 +1966,10 @@ _codex_prune() {
 # The prune command is called with "count" or, under --prune, "remove",
 # for install directories the live one has superseded.
 _UUA_TOOLS=(
-  'claude|Claude Code|claude|npm:@anthropic-ai/claude-code|auto|claude update|||'
-  'codex|Codex|codex|_codex_latest|self|codex update|||_codex_prune'
-  'opencode|OpenCode|opencode|npm:@opencode/cli|auto|opencode upgrade||_repair_opencode|'
-  'pi|Pi|pi|npm:@earendil-works/pi-coding-agent|self|pi update --self|pi update --extensions||'
+  'claude|Claude Code|claude|npm:@anthropic-ai/claude-code|auto|claude update||||_claude_latest'
+  'codex|Codex|codex|_codex_latest|self|codex update|||_codex_prune|'
+  'opencode|OpenCode|opencode|npm:@opencode/cli|auto|opencode upgrade||_repair_opencode||'
+  'pi|Pi|pi|npm:@earendil-works/pi-coding-agent|self|pi update --self|pi update --extensions|||'
 )
 
 
@@ -2003,6 +2049,7 @@ _worker_tool() {
   local extensions="$6"
   local repair="$7"
   local prune="$8"
+  local native_source="$9"
 
   local log="$_UUA_RUN_DIR/$key.log"
   local state current latest after n rc
@@ -2040,7 +2087,7 @@ _worker_tool() {
     latest="$current"
     notes+=("managed by apt")
 
-  elif ! latest="$(_fetch "ai-$key" "$_UUA_QUERY_LIMIT" _latest_version "$version_source")" ||
+  elif ! latest="$(_fetch "ai-$key" "$_UUA_QUERY_LIMIT" _latest_version "$version_source" "$native_source" "$cmd")" ||
     [[ -z "$latest" ]]
   then
     state=failed
@@ -2227,7 +2274,7 @@ _job_ai() {
   (( _UUA_VERBOSE )) &&
     _follow_start "$_UUA_RUN_DIR/$1"{.log,-repair.log,-extensions.log}
 
-  _worker_tool "$1" "${(@)fields[3,9]}"
+  _worker_tool "$1" "${(@)fields[3,10]}"
   _follow_stop
 
   _report_tool "$1"
@@ -2345,7 +2392,7 @@ _prefetch_all() {
     (( ${+_UUA_J_NAME[$key]} )) || continue
     [[ "$_UUA_J_OWNER[$key]" == (absent|apt) ]] && continue
 
-    _prefetch "$key" "$_UUA_QUERY_LIMIT" _latest_version "$reply[4]"
+    _prefetch "$key" "$_UUA_QUERY_LIMIT" _latest_version "$reply[4]" "$reply[10]" "$reply[3]"
   done
 }
 

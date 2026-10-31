@@ -225,8 +225,58 @@ expect "owner: bun global"      bun    "$(owner bun-tool)"
 expect "owner: own installer"   native "$(owner native-tool)"
 expect "owner: not installed"   absent "$(owner no-such-tool)"
 
+# A native install follows its own release channel, the others the
+# registry (here a stand-in for either).
+_fake_registry() { print 2.1.0 }
+_fake_channel() { print 2.0.0 }
+
+latest_of() {
+  NVM_DIR="$TMP/nvm" BUN_INSTALL="$TMP/bun" _latest_version _fake_registry "${2-_fake_channel}" "$1"
+}
+
+expect "latest: native install follows its channel" 2.0.0 "$(latest_of native-tool)"
+expect "latest: nvm's npm follows the registry"     2.1.0 "$(latest_of npm-tool)"
+expect "latest: bun global follows the registry"    2.1.0 "$(latest_of bun-tool)"
+expect "latest: no channel, the registry"           2.1.0 "$(latest_of native-tool "")"
+
 path=(${path:#$TMP/nvm/versions/node/v1.0.0/bin})
 path=(${path:#$TMP/links})
+
+
+# ── Claude Code's release channel ───────────────────────────
+
+stub curl '
+for a; do url="$a"; done
+case "$url" in
+  */claude-code-releases/latest) printf 2.0.0 ;;
+  */claude-code-releases/stable) printf "1.9.0\n" ;;
+  *) exit 22 ;;
+esac'
+
+export CLAUDE_CONFIG_DIR="$TMP/claude"
+mkdir -p "$CLAUDE_CONFIG_DIR"
+
+expect "claude channel: latest by default" 2.0.0 "$(_claude_latest)"
+
+print -r -- '{"autoUpdatesChannel": "latest"}' >"$CLAUDE_CONFIG_DIR/settings.json"
+expect "claude channel: latest chosen" 2.0.0 "$(_claude_latest)"
+
+print -r -- '{"autoUpdatesChannel": "stable"}' >"$CLAUDE_CONFIG_DIR/settings.json"
+expect "claude channel: stable chosen" 1.9.0 "$(_claude_latest)"
+
+rm -f "$CLAUDE_CONFIG_DIR/settings.json"
+unset CLAUDE_CONFIG_DIR
+
+stub curl 'exit 22'
+expect "claude channel: unreachable" "" "$(_claude_latest)"
+
+# The first two attempts drop, the third gets through.
+rm -f "$TMP/curl-tries"
+stub curl '
+echo x >>"'"$TMP"'/curl-tries"
+[ "$(wc -l <"'"$TMP"'/curl-tries")" -lt 3 ] && exit 28
+printf 2.0.0'
+expect "claude channel: a dropped request is retried" 2.0.0 "$(_claude_latest)"
 
 
 # ── AI CLI workers ──────────────────────────────────────────
@@ -252,7 +302,7 @@ _fake_latest() {
 
 worker() {
   rm -f "$_UUA_RUN_DIR"/fake*(N)
-  _worker_tool fake "$1" _fake_latest self "faketool update" "${2:-}" "" ""
+  _worker_tool fake "$1" _fake_latest self "faketool update" "${2:-}" "" "" "${3:-}"
   print -r -- "$(<"$_UUA_RUN_DIR/fake.result")"
 }
 
@@ -267,6 +317,18 @@ expect "worker: updater that does not move" \
 
 print 2.0.0 >"$TMP/fake-version"
 expect "worker: up to date" "ok|2.0.0|2.0.0|" "$(worker faketool)"
+
+# The registry is ahead (2.0.0) of the channel the tool's own installer
+# follows (1.0.0): there is nothing for the updater to fetch.
+_fake_lagging_channel() {
+  print 1.0.0
+}
+
+print 1.0.0 >"$TMP/fake-version"
+touch "$TMP/fake-bump"
+expect "worker: registry ahead of the native channel" "ok|1.0.0|1.0.0|" \
+  "$(worker faketool "" _fake_lagging_channel)"
+rm -f "$TMP/fake-bump"
 
 print 1.0.0 >"$TMP/fake-version"
 _UUA_CHECK_ONLY=1
@@ -666,6 +728,7 @@ zsh "$ROOT/uua" --bogus 2>/dev/null
 expect "cli: unknown option" 2 $?
 
 stub claude 'echo "1.0.0 (Claude Code)"'
+stub curl 'printf 2.0.0'
 
 # No nvm here: an AI-only run switches to nvm's default Node, which
 # would pull the real tools and npm back onto PATH.
