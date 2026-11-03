@@ -787,6 +787,7 @@ reset_plan
 _plan_add a one "a job" "" _job_slow_b
 _plan_add r two "running" "" _job_slow_b
 _plan_add w two "a waiting job with a long name" "r" _job_slow_b
+_plan_add s two "never ran" "r" _job_slow_b
 (( _UUA_T0 = EPOCHREALTIME - 10, _UUA_T_END = EPOCHREALTIME ))
 _UUA_J_STATE[a]=done _UUA_J_ROW[a]="updated|$(printf 'x%.0s' {1..200})"
 (( _UUA_J_START[a] = _UUA_T0, _UUA_J_END[a] = _UUA_T0 + 4 ))
@@ -832,12 +833,16 @@ expect "board: wide characters fit" 1 "$(( ${(m)#line} < 80 ))"
 _UUA_J_STATE[r]=done _UUA_J_ROW[r]="ok|fine" _UUA_J_END[r]=$_UUA_T_END
 _UUA_J_STATE[w]=done _UUA_J_ROW[w]="absent|not installed"
 _UUA_J_START[w]=$_UUA_T_END _UUA_J_END[w]=$_UUA_T_END
+_UUA_J_STATE[s]=done _UUA_J_ROW[s]="stopped|not started"
+_UUA_J_START[s]=$_UUA_T_END _UUA_J_END[s]=$_UUA_T_END
 _UUA_COLS=100
 _board_lines 1
 expect "board: the header" yes "$(has "$reply[1]" " ✓ UUA  ==")"
 expect "board: sub-lines in the last frame" yes "$(has "$(plain $reply)" "· a sub-line")"
 expect "board: a full bar when done" yes "$(has "$(plain $reply)" "…  ===================  ")"
 expect "board: the run's bar" yes "$(has "$(plain $reply[1])" " ✓ UUA  ===")"
+expect "board: absent rows are hidden" no "$(has "$(plain $reply)" "not installed")"
+expect "board: a never-started row stays" yes "$(has "$(plain $reply)" "not started")"
 
 # The AI CLI jobs, with the updater's output streamed under --verbose.
 print 1.0.0 >"$TMP/fake-version"
@@ -938,7 +943,8 @@ out="$(PATH="$TMP/bin:/usr/bin:/bin" NVM_DIR="$TMP/no-nvm" zsh "$ROOT/uua" --che
 expect "cli: --check exits 100 when updates exist" 100 $?
 expect "cli: --check reports the update" yes \
   "$(has "$out" "Claude Code  1.0.0 → 2.0.0 · update available")"
-expect "cli: absent tools are listed" yes "$(has "$out" "– Codex        not installed")"
+expect "cli: absent tools are hidden" no "$(has "$out" "not installed")"
+expect "cli: absent tools are not named" no "$(has "$out" "Codex")"
 expect "cli: absent tools are not counted" yes "$(has "$out" "Summary  1 item(s)")"
 
 # The same run on a terminal: the live board, its last frame kept.

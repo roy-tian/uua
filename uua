@@ -17,9 +17,10 @@
 #   AI CLIs with installers of their own, from the start
 #
 # The registry and release queries all go out first, while the sudo
-# password is typed. On a terminal a live board shows every job, what it
-# is doing and how far it has got. `uua --help` is the reference for the
-# options, what gets removed, and exit status.
+# password is typed. On a terminal a live board shows the jobs, what
+# each is doing and how far it has got; a tool this machine does not
+# have is not shown. `uua --help` is the reference for the options,
+# what gets removed, and exit status.
 
 UUA_VERSION="0.1.6"
 
@@ -51,7 +52,7 @@ _UUA_WANT_AI=0
 _UUA_FILTERED=0
 
 # Outcome counters: every reported item lands in exactly one of these.
-# Tools that are not installed are listed but not counted.
+# Tools that are not installed are neither listed nor counted.
 _UUA_UPTODATE=0
 _UUA_UPDATED=0
 _UUA_AVAILABLE=0
@@ -139,6 +140,7 @@ typeset -gA _UUA_ICON=(
   available ↑
   failed    ✗
   absent    –
+  stopped   –
   warn      ⚠
   info      →
   note      ·
@@ -166,7 +168,7 @@ _fmt_line() {
   _state_color "$1"
 
   case "$1" in
-    absent|note|tail) REPLY="$C_DIM$_UUA_ICON[$1] $2$C_RESET" ;;
+    absent|stopped|note|tail) REPLY="$C_DIM$_UUA_ICON[$1] $2$C_RESET" ;;
     *)                REPLY="$REPLY$_UUA_ICON[$1]$C_RESET $2" ;;
   esac
 }
@@ -1743,10 +1745,12 @@ _step_node_prune() {
   local list="$_UUA_RUN_DIR/node-stale"
   local v removed=0 busy=0 failed=0
 
-  if [[ ! -s "$list" ]] || ! _load_nvm; then
-    _row ok "no old Node.js releases"
+  if ! _load_nvm; then
+    _row absent "nvm not installed"
     return 0
   fi
+
+  [[ -s "$list" ]] || { _row ok "no old Node.js releases"; return 0 }
 
   _phase 0 0.95 2
 
@@ -2537,6 +2541,10 @@ _plan_build() {
     _tool_owner rustup
     _UUA_J_OWNER[rustup]="$REPLY"
 
+    # The toolchain job stands or falls with rustup: without rustup
+    # there are no toolchains to update.
+    _UUA_J_OWNER[rust]="$REPLY"
+
     # A rustup apt owns has just been updated by the apt job; this one
     # waits before reporting it managed.
     [[ "$REPLY" == apt ]] && _UUA_J_DEPS[rustup]=apt
@@ -2872,7 +2880,7 @@ _plan_stop() {
       _UUA_J_STATE[$key]=done
       _UUA_J_START[$key]="$EPOCHREALTIME"
       _UUA_J_END[$key]="$EPOCHREALTIME"
-      _UUA_J_ROW[$key]="absent|not started"
+      _UUA_J_ROW[$key]="stopped|not started"
     fi
   done
 
@@ -3159,7 +3167,7 @@ _job_watch() {
 # shows every row with its sub-lines.
 _board_lines() {
   local final="$1"
-  local -a out keys pri subs
+  local -a out keys pri subs visible
   local -A show
   local key st rs rt icon color name text label tail line pre
   local group prev="" times bar gc
@@ -3193,8 +3201,13 @@ _board_lines() {
   (( txt = W - gut - 3 - nam - tim - (pb ? pb + 2 : 0) ))
   (( ind = gut + 3 + nam ))
 
+  # What the board shows: every planned job but a tool this machine
+  # does not have.
+  _visible_jobs
+  visible=("$reply[@]")
+
   # How far each job has got; the run's progress is their average.
-  for key in $_UUA_PLAN; do
+  for key in $visible; do
     case "$_UUA_J_STATE[$key]" in
       run)
         _job_watch "$key"
@@ -3208,7 +3221,7 @@ _board_lines() {
     esac
   done
 
-  (( $#_UUA_PLAN )) && (( progress /= $#_UUA_PLAN ))
+  (( $#visible )) && (( progress /= $#visible ))
 
   # The header: a mark, the run's progress bar and the time so far.
   gc="$_UUA_GC[total]"
@@ -3226,7 +3239,7 @@ _board_lines() {
   fi
 
   _fmt_secs $(( tmax - t0 ))
-  times="  $ndone/$#_UUA_PLAN  $REPLY"
+  times="  $ndone/$#visible  $REPLY"
   (( bw = W - 8 - ${#times} ))
   (( bw < 4 )) && bw=4
   _pbar "$progress" "$bw" "$gc"
@@ -3241,13 +3254,13 @@ _board_lines() {
 
   # A terminal too short for every row shows the running ones first,
   # then failures, then the waiting ones.
-  keys=($_UUA_PLAN)
+  keys=("$visible[@]")
   (( avail = _UUA_LINES - 3 - $#out ))
 
   if (( ! final && $#keys > avail )); then
     i=0
 
-    for key in $_UUA_PLAN; do
+    for key in $visible; do
       (( i++ ))
 
       case "$_UUA_J_STATE[$key]:${_UUA_J_ROW[$key]%%|*}" in
@@ -3266,7 +3279,7 @@ _board_lines() {
 
     keys=()
 
-    for key in $_UUA_PLAN; do
+    for key in $visible; do
       (( ${+show[$key]} )) && keys+=("$key")
     done
   fi
@@ -3340,12 +3353,12 @@ _board_lines() {
         _fit "$rt" "$txt"
 
         case "$rs" in
-          ok)     text="$REPLY" ;;
-          absent) text="$C_DIM$REPLY$C_RESET" name="$C_DIM$name$C_RESET" ;;
-          *)      text="$color$REPLY$C_RESET" ;;
+          ok)      text="$REPLY" ;;
+          stopped) text="$C_DIM$REPLY$C_RESET" name="$C_DIM$name$C_RESET" ;;
+          *)       text="$color$REPLY$C_RESET" ;;
         esac
 
-        if [[ "$rs" == absent ]]; then
+        if [[ "$rs" == stopped ]]; then
           _rep " " "$pb"
           bar="$REPLY"
         else
@@ -3375,8 +3388,8 @@ _board_lines() {
     fi
   done
 
-  (( $#keys < $#_UUA_PLAN )) &&
-    out+=("$C_DIM${(l:ind:: :)e0}$at$(( ind + 1 ))G… $(( $#_UUA_PLAN - $#keys )) more$C_RESET")
+  (( $#keys < $#visible )) &&
+    out+=("$C_DIM${(l:ind:: :)e0}$at$(( ind + 1 ))G… $(( $#visible - $#keys )) more$C_RESET")
 
   reply=("${out[@]}")
 }
@@ -3479,7 +3492,8 @@ _board_begin() {
     printf '\n\033[?25l\033[?7l'
   else
     _UUA_LIVE=0
-    print -r -- "${C_BOLD}UUA$C_RESET $C_DIM· $#_UUA_PLAN jobs$C_RESET"
+    _visible_jobs
+    print -r -- "${C_BOLD}UUA$C_RESET $C_DIM· $#reply jobs$C_RESET"
   fi
 }
 
@@ -3559,6 +3573,31 @@ _board_end() {
 }
 
 
+# True when job $1 has nothing to work on: a tool this machine does
+# not have, or nothing of its kind (no Rust toolchains, no global
+# packages). Hidden from the board and the printout, and never counted.
+# The plan's owner resolution knows it for the AI CLIs and rustup
+# before the job even runs; every other job says so in its row once it
+# has reported.
+_job_hidden() {
+  local key="$1"
+
+  [[ "${_UUA_J_ROW[$key]%%|*}" == absent ]] && return 0
+  [[ "$_UUA_J_OWNER[$key]" == absent ]]
+}
+
+
+# The planned jobs that are shown, into reply.
+_visible_jobs() {
+  local key
+  reply=()
+
+  for key in $_UUA_PLAN; do
+    _job_hidden "$key" || reply+=("$key")
+  done
+}
+
+
 # A finished job for a run without a board: its row, time and
 # sub-lines.
 _print_job() {
@@ -3568,10 +3607,12 @@ _print_job() {
   local line
   local -F took
 
+  _job_hidden "$key" && return 0
+
   _fmt_line "$rs" "${(r:12:)_UUA_J_NAME[$key]} $rt"
   line="$REPLY"
 
-  if [[ "$rs" != absent ]]; then
+  if [[ "$rs" != stopped ]]; then
     (( took = _UUA_J_END[$key] - _UUA_J_START[$key] ))
     _fmt_secs "$took"
     line+="  $C_DIM($REPLY)$C_RESET"
@@ -3719,6 +3760,9 @@ How it runs:
   nothing, so every job starts at once. The registry and release
   queries all go out first, while the sudo password is typed.
 
+  A tool this machine does not have is not listed: no row on the
+  board, no line in the printout, nothing in the summary.
+
   On a terminal a live board shows each job's state, what it is doing
   and the latest line of its log, and a progress bar in the color of its
   group (apt, node, bun, rust, AI CLIs), under a bar for the whole run;
@@ -3796,7 +3840,8 @@ _summary() {
   (( wall = _UUA_T_END - _UUA_T0 ))
 
   for key in $_UUA_PLAN; do
-    [[ "${_UUA_J_ROW[$key]%%|*}" == absent ]] && continue
+    _job_hidden "$key" && continue
+    [[ "${_UUA_J_ROW[$key]%%|*}" == stopped ]] && continue
 
     (( work += _UUA_J_END[$key] - _UUA_J_START[$key] ))
     (( ran++ ))

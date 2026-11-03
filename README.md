@@ -71,7 +71,7 @@ finishes. `make demo` shows the board on a fake system, updating nothing.
   Debian/Ubuntu install.
 - Each step covers a tool only when it is installed: nvm for Node.js, npm,
   bun, rustup, and any of Claude Code, Codex, OpenCode and Pi. Missing
-  tools are listed and skipped.
+  tools are skipped without being listed.
 
 macOS is not supported.
 
