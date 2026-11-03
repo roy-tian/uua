@@ -22,7 +22,7 @@
 # have is not shown. `uua --help` is the reference for the options,
 # what gets removed, and exit status.
 
-UUA_VERSION="0.1.6"
+UUA_VERSION="0.1.7"
 
 autoload -Uz is-at-least
 zmodload zsh/datetime
