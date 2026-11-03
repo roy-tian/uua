@@ -1,8 +1,8 @@
 # UUA — Universal Update All
 
-Updates APT packages, Node.js (through nvm), npm, Bun, the global npm/bun
-packages and a set of AI coding CLIs in one run. A single zsh script
-(`uua`).
+Updates APT packages, Node.js (through nvm), npm, Bun, the global
+npm/bun packages, rustup with the Rust toolchains it manages and a set
+of AI coding CLIs in one run. A single zsh script (`uua`).
 
 ## How it runs
 
@@ -15,27 +15,30 @@ node ──→ npm ──→ npm -g
               └──────────────────→ AI CLIs installed by npm
 bun ───→ bun -g   (after node too)
      └───────────────────────────→ AI CLIs installed by bun
+rustup ─→ rust toolchains   (after apt too, when apt installed rustup)
 AI CLIs with installers of their own, from the start
 ```
 
-APT, the Node.js chain, the Bun chain and self-updating CLIs such as a
-native Claude Code or Codex all run side by side. A CLI that npm or Bun
-installed waits for that package manager's own update, then shares its
-global tree with the sweep under a lock. With `--prune`, old Node.js
-releases go last, once nothing can be running one; `--check` changes
-nothing, so every job starts at once. The registry and release queries
-all go out first, while the sudo password is typed.
+APT, the Node.js chain, the Bun chain, the rustup chain and
+self-updating CLIs such as a native Claude Code or Codex all run side
+by side. A CLI that npm or Bun installed waits for that package
+manager's own update, then shares its global tree with the sweep under
+a lock. With `--prune`, old Node.js releases go last, once nothing can
+be running one; `--check` changes nothing, so every job starts at once.
+The registry and release queries all go out first, while the sudo
+password is typed.
 
 On a terminal a live board shows every job: its state, what it is doing
 and the latest line of its log, a progress bar and its time, under a bar
 for the whole run. A bar only ever grows: each job counts its progress
 from what its commands print (packages set up, download percentages) or
 eases it in over time, and fills when the job is done. The bars are a
-line in each group's color (apt, node, bun, AI CLIs, and the run) over a
-faint one; without colors, as here midway through a run, "=" over "-":
+line in each group's color (apt, node, bun, rust, AI CLIs, and the run)
+over a faint one; without colors, as here midway through a run, "=" over
+"-":
 
 ```
- ⠴ UUA  =====================================================----------------------  6/11  3.5s
+ ⠴ UUA  =====================================================----------------------  7/13  3.5s
 
  SYSTEM ⠦  apt          installing 12 update(s)  Unpacking libfake…  ==========---------   3.0s
  NODE   ↑  node         22.0.0 → 24.1.0 · upgraded                   ===================   1.6s
@@ -44,6 +47,8 @@ faint one; without colors, as here midway through a run, "=" over "-":
         ◌  prune        waiting for 4 jobs                           -------------------
  BUN    ↑  bun          1.1.0 → 1.2.0 · upgraded                     ===================   1.6s
         ⠹  bun -g       updating typescript-language-server  insta…  =========----------   1.3s
+ RUST   ↑  rustup       1.28.2 → 1.29.2 · upgraded                   ===================   0.9s
+        ⠦  rust         updating 2 toolchain(s)  45.0%               =========----------   0.6s
  AI     ↑  Claude Code  2.0.0 → 2.1.0 · upgraded                     ===================   2.3s
         ✓  Codex        0.50.0 · up to date                          ===================   0.3s
         ↑  OpenCode     1.0.0 → 1.1.0 · upgraded                     ===================   1.1s
@@ -65,8 +70,8 @@ finishes. `make demo` shows the board on a fake system, updating nothing.
 - `flock` (util-linux) and `timeout` (coreutils), present on every
   Debian/Ubuntu install.
 - Each step covers a tool only when it is installed: nvm for Node.js, npm,
-  bun, and any of Claude Code, Codex, OpenCode and Pi. Missing tools are
-  listed and skipped.
+  bun, rustup, and any of Claude Code, Codex, OpenCode and Pi. Missing
+  tools are listed and skipped.
 
 macOS is not supported.
 
@@ -115,6 +120,7 @@ uua --check         report available updates; installs and removes nothing
 uua --prune         also remove superseded releases (see below)
 uua --apt           only APT packages
 uua --node          only node/npm/bun and their global packages
+uua --rust          only rustup and the Rust toolchains it manages
 uua --ai            only the AI CLI tools
 uua --verbose       show every command's output as it runs, above the board
 uua --keep-logs     keep this run's logs (kept anyway on failure)
@@ -135,8 +141,10 @@ without a terminal, the notice is printed once.
 Nothing, unless `--prune` is given. With it, uua removes Node.js releases
 older than the LTS (except the one the nvm `default` alias points at),
 Codex releases other than the current one, and APT packages nothing needs
-(`apt-get autoremove`). A release a running process uses is kept. Without
-`--prune`, uua reports what it would remove.
+(`apt-get autoremove`). A release a running process uses is kept. No
+Rust toolchains are removed, even with `--prune` — a pin such as
+`1.75.0-...` is usually deliberate. Without `--prune`, uua reports what
+it would remove.
 
 The nvm `default` alias moves to `lts/*` only when it is unset, dangling,
 or names the exact release being replaced. A pin (`22`, `lts/iron`,

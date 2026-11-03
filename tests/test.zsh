@@ -351,6 +351,208 @@ expect "report: row" yes "$(has "$out" "✓ 2.0.0 · up to date")"
 expect "report: extensions failure" yes "$(has "$out" "✗ extensions update failed")"
 
 
+# ── rustup ──────────────────────────────────────────────────
+
+# The channel file, quoted either way TOML allows, and fetched from the
+# mirror RUSTUP_UPDATE_ROOT names when there is one.
+stub curl '
+for a; do case "$a" in http*) url=$a ;; esac; done
+echo "$url" >"'"$TMP"'/curl-url"
+cat "'"$TMP"'/rustup-release.toml"'
+
+printf "schema-version = '1'\nversion = '1.29.2'\n" >"$TMP/rustup-release.toml"
+expect "rustup channel: the version served" 1.29.2 "$(_rustup_latest)"
+expect "rustup channel: the channel's URL" yes \
+  "$(has "$(<"$TMP/curl-url")" "static.rust-lang.org/rustup/release-stable.toml")"
+
+RUSTUP_UPDATE_ROOT=https://example.com/rustup-mirror
+expect "rustup channel: the mirror followed" 1.29.2 "$(_rustup_latest)"
+expect "rustup channel: the mirror's URL" yes \
+  "$(has "$(<"$TMP/curl-url")" "example.com/rustup-mirror/release-stable.toml")"
+unset RUSTUP_UPDATE_ROOT
+
+printf 'version = "1.30.0"\n' >"$TMP/rustup-release.toml"
+expect "rustup channel: double quotes too" 1.30.0 "$(_rustup_latest)"
+
+stub curl 'exit 22'
+expect "rustup channel: unreachable" "" "$(_rustup_latest)"
+
+# Found on PATH, or where the installer puts it when the shell has not
+# picked that up.
+mkdir -p "$TMP/cargo-home/bin" "$TMP/empty"
+print -r -- '#!/bin/sh' >"$TMP/cargo-home/bin/rustup"
+chmod +x "$TMP/cargo-home/bin/rustup"
+
+find_rustup() (
+  CARGO_HOME="$1"
+  PATH="$TMP/empty"
+  _load_rustup && command -v rustup
+)
+
+expect "load: in CARGO_HOME, off PATH" "$TMP/cargo-home/bin/rustup" \
+  "$(find_rustup "$TMP/cargo-home")"
+expect "load: nothing to find" "" "$(find_rustup "$TMP/nowhere")"
+
+# A rustup stub: the version in a file "self update" replaces, the
+# toolchains, and what check and update report, in files too.
+printf "version = '1.29.0'\n" >"$TMP/rustup-release.toml"
+stub curl 'cat "'"$TMP"'/rustup-release.toml"'
+
+stub rustup '
+case "$1 $2" in
+  "--version ") cat "'"$TMP"'/rustup-version" ;;
+  "self update")
+    echo "info: self update finished"
+    echo 1.29.0 >"'$TMP'/rustup-version" ;;
+  "toolchain list") cat "'$TMP'/rustup-toolchains" ;;
+  "check ")
+    cat "'$TMP'/rustup-check"
+    exit "$(cat "'$TMP'/rustup-check-rc")" ;;
+  "update --no-self-update")
+    [ -f "'$TMP'/rustup-fail" ] && { echo "error: network down" >&2; exit 1; }
+    cat "'$TMP'/rustup-update-out" ;;
+esac'
+
+print -l "stable-x86_64-unknown-linux-gnu (active, default)" \
+  "nightly-x86_64-unknown-linux-gnu" >"$TMP/rustup-toolchains"
+expect "rustup: names apart from markers" \
+  $'stable-x86_64-unknown-linux-gnu\nnightly-x86_64-unknown-linux-gnu' \
+  "$(_rustup_toolchains)"
+
+job_run() {
+  _UUA_UPTODATE=0 _UUA_UPDATED=0 _UUA_AVAILABLE=0 _UUA_FAILED_STEPS=0
+  "$1"
+  print -r -- "counts:$_UUA_UPTODATE $_UUA_UPDATED $_UUA_AVAILABLE $_UUA_FAILED_STEPS"
+}
+
+# The rustup job: self-update against the channel's release.
+print 1.28.0 >"$TMP/rustup-version"
+
+out="$(job_run _step_rustup)"
+expect "rustup job: upgraded" yes "$(has "$out" "↑ 1.28.0 → 1.29.0 · upgraded")"
+expect "rustup job: counted" "counts:0 1 0 0" "${${(f)out}[-1]}"
+
+print 1.29.0 >"$TMP/rustup-version"
+out="$(job_run _step_rustup)"
+expect "rustup job: up to date" yes "$(has "$out" "✓ 1.29.0 · up to date")"
+expect "rustup job: nothing changed" 1.29.0 "$(<"$TMP/rustup-version")"
+
+print 1.28.0 >"$TMP/rustup-version"
+_UUA_CHECK_ONLY=1
+out="$(job_run _step_rustup)"
+expect "rustup job: check mode" yes "$(has "$out" "↑ 1.28.0 → 1.29.0 · update available")"
+expect "rustup job: check counts" "counts:0 0 1 0" "${${(f)out}[-1]}"
+expect "rustup job: check changes nothing" 1.28.0 "$(<"$TMP/rustup-version")"
+_UUA_CHECK_ONLY=0
+
+# A rustup dpkg owns is apt's, and a version query that fails is a
+# failure, not "current". The rehash drops the real dpkg-query the
+# earlier owner tests left in the command hash.
+stub dpkg-query 'exit 0'
+rehash
+out="$(job_run _step_rustup)"
+expect "rustup job: apt's to update" yes "$(has "$out" "· managed by apt")"
+expect "rustup job: apt's counted done" "counts:1 0 0 0" "${${(f)out}[-1]}"
+
+# The plan: rust waits for rustup, and rustup for apt when apt owns it.
+rust_plan() {
+  _UUA_PLAN=() _UUA_J_NAME=() _UUA_J_GROUP=() _UUA_J_DEPS=()
+  _UUA_FILTERED=1 _UUA_WANT_RUST=1
+  _plan_build
+}
+
+rust_plan
+expect "plan: apt's rustup after apt" apt "$_UUA_J_DEPS[rustup]"
+expect "plan: rust after rustup" rustup "$_UUA_J_DEPS[rust]"
+
+rm -f "$TMP/bin/dpkg-query"
+rehash
+
+rust_plan
+expect "plan: rustup on its own" "" "$_UUA_J_DEPS[rustup]"
+_UUA_FILTERED=0 _UUA_WANT_RUST=0
+
+stub curl 'exit 22'
+out="$(job_run _step_rustup)"
+expect "rustup job: channel unreachable" yes "$(has "$out" "✗ unable to detect the version")"
+expect "rustup job: failure counted" "counts:0 0 0 1" "${${(f)out}[-1]}"
+stub curl 'cat "'"$TMP"'/rustup-release.toml"'
+
+# The toolchain job: update, and check against "rustup check". The
+# banners rustup pads into columns — the shorter name gets the wider
+# padding — and the status spelling moved between releases; both are
+# covered, and the "rustup - ..." line check also prints is the rustup
+# job's to report, not this one's.
+cat >"$TMP/rustup-update-out" <<'EOF'
+
+     stable-x86_64-unknown-linux-gnu updated - 1.99.0 (58cf8f9c3 2026-02-01) (from 1.98.0 (hash 2026-01-01))
+  nightly-x86_64-unknown-linux-gnu unchanged - 1.104.0-nightly (hash 2026-02-01)
+EOF
+
+out="$(job_run _step_rust)"
+expect "rust job: one of two upgraded" yes "$(has "$out" "↑ 1 toolchain(s) upgraded")"
+expect "rust job: which one" yes \
+  "$(has "$out" "↑ stable-x86_64-unknown-linux-gnu 1.99.0 (58cf8f9c3 2026-02-01) (from 1.98.0")"
+expect "rust job: counted" "counts:0 1 0 0" "${${(f)out}[-1]}"
+
+cat >"$TMP/rustup-update-out" <<'EOF'
+
+   stable-x86_64-unknown-linux-gnu unchanged - 1.99.0 (58cf8f9c3 2026-02-01)
+  nightly-x86_64-unknown-linux-gnu unchanged - 1.104.0-nightly (hash 2026-02-01)
+EOF
+
+out="$(job_run _step_rust)"
+expect "rust job: nothing to do" yes "$(has "$out" "✓ up to date")"
+expect "rust job: up to date counted" "counts:1 0 0 0" "${${(f)out}[-1]}"
+
+touch "$TMP/rustup-fail"
+out="$(job_run _step_rust)"
+expect "rust job: update failure" yes "$(has "$out" "✗ update failed")"
+expect "rust job: failure counted" "counts:0 0 0 1" "${${(f)out}[-1]}"
+rm -f "$TMP/rustup-fail"
+
+cat >"$TMP/rustup-check" <<'EOF'
+stable-x86_64-unknown-linux-gnu - update available: 1.98.0 (hash 2026-01-01) -> 1.99.0 (58cf8f9c3 2026-02-01)
+nightly-x86_64-unknown-linux-gnu - Update available : 1.103.0-nightly (hash 2026-01-01) -> 1.104.0-nightly (hash 2026-02-01)
+rustup - Update available : 1.28.0 -> 1.29.0
+EOF
+print 100 >"$TMP/rustup-check-rc"
+
+_UUA_CHECK_ONLY=1
+out="$(job_run _step_rust)"
+expect "rust job: check mode" yes "$(has "$out" "↑ 2 update(s) available")"
+expect "rust job: check details" yes \
+  "$(has "$out" "↑ stable-x86_64-unknown-linux-gnu 1.98.0 (hash 2026-01-01) -> 1.99.0")"
+expect "rust job: check details, the old spelling" yes \
+  "$(has "$out" "↑ nightly-x86_64-unknown-linux-gnu 1.103.0-nightly (hash 2026-01-01) -> 1.104.0-nightly")"
+expect "rust job: rustup's own line left to its job" no \
+  "$(has "$out" "rustup 1.28.0")"
+expect "rust job: check counted" "counts:0 0 1 0" "${${(f)out}[-1]}"
+
+cat >"$TMP/rustup-check" <<'EOF'
+stable-x86_64-unknown-linux-gnu - up to date: 1.99.0 (58cf8f9c3 2026-02-01)
+nightly-x86_64-unknown-linux-gnu - Up to date : 1.104.0-nightly (hash 2026-02-01)
+rustup - Up to date : 1.29.0
+EOF
+print 0 >"$TMP/rustup-check-rc"
+
+out="$(job_run _step_rust)"
+expect "rust job: check up to date" yes "$(has "$out" "✓ up to date")"
+expect "rust job: check nothing counted" "counts:1 0 0 0" "${${(f)out}[-1]}"
+
+print 1 >"$TMP/rustup-check-rc"
+out="$(job_run _step_rust)"
+expect "rust job: check failure" yes "$(has "$out" "✗ unable to check for updates")"
+_UUA_CHECK_ONLY=0
+
+print "no installed toolchains" >"$TMP/rustup-toolchains"
+out="$(job_run _step_rust)"
+expect "rust job: no toolchains" yes "$(has "$out" "– no toolchains installed")"
+expect "rust job: absent not counted" "counts:0 0 0 0" "${${(f)out}[-1]}"
+
+rm -f "$TMP/bin/rustup"
+
+
 # ── Pruning ─────────────────────────────────────────────────
 
 export CODEX_HOME="$TMP/codex"
@@ -837,11 +1039,13 @@ fake_run() {
 F="$TMP/fake"
 out="$(fake_run "$F" FAKE_SPEED=0.1 zsh "$ROOT/uua" --prune)"
 expect "run: succeeds" 0 $?
-expect "run: the header, without the version" "UUA · 11 jobs" "${${(f)out}[1]}"
+expect "run: the header, without the version" "UUA · 13 jobs" "${${(f)out}[1]}"
 
 mods="$F/home/.nvm/versions/node/v24.1.0/lib/node_modules"
 expect "run: every tool upgraded" "0 1.2.0 2.1.0 1.0.0 10.2.0 5.1.0" \
   "$(<"$F/db/apt-pending") $(<"$F/db/bun") $(<"$F/db/claude") $(<"$mods/@earendil-works/pi-coding-agent/version") $(<"$mods/npm/version") $(<"$mods/typescript/version")"
+expect "run: rustup and both toolchains upgraded" "1.29.0 1.99.0 1.104.0-nightly" \
+  "$(<"$F/db/rustup") $(<"$F/db/rust-stable") $(<"$F/db/rust-nightly")"
 expect "run: bun globals and bun's CLI" yes \
   "$(grep -q 4.1.0 "$F/home/.bun/install/global/node_modules/typescript-language-server/package.json" &&
      grep -q 1.1.0 "$F/home/.bun/install/global/node_modules/@opencode/cli/package.json" && print yes)"
@@ -859,9 +1063,18 @@ expect "run: npm -g after npm"    yes "$(before npm "npm -g")"
 expect "run: Pi after npm"        yes "$(before npm Pi)"
 expect "run: OpenCode after bun"  yes "$(before bun OpenCode)"
 expect "run: bun -g after node"   yes "$(before node "bun -g")"
+expect "run: rust after rustup"   yes "$(before rustup rust)"
 expect "run: prune last"          prune "$order[-1]"
 expect "run: jobs overlapped" yes \
   "$([[ "$out" =~ '([0-9.]+)× in parallel' ]] && (( match[1] > 1.5 )) && print yes)"
+
+# The Rust group against a fresh fake system, checked: everything is
+# reported and nothing installed.
+out="$(fake_run "$F" FAKE_SPEED=0.1 zsh "$ROOT/uua" --check --rust)"
+expect "check: rust exits 100 when updates exist" 100 $?
+expect "check: rustup reported" yes "$(has "$out" "1.28.0 → 1.29.0 · update available")"
+expect "check: toolchains reported" yes "$(has "$out" "2 update(s) available")"
+expect "check: nothing installed" "1.28.0 1.98.0" "$(<"$F/db/rustup") $(<"$F/db/rust-stable")"
 
 # Stopped halfway: model APT's protected dpkg phase by ignoring INT.
 # It must finish the command it is running and start nothing more.

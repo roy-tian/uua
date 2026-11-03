@@ -3,15 +3,17 @@
 # uua — Universal Update All
 #
 # Updates APT packages, Node.js (through nvm), npm, Bun, the global
-# npm/bun packages and a set of AI coding CLIs in one run. Every step is
-# a job that starts the moment the jobs it builds on have finished, so
-# everything that can run at the same time does:
+# npm/bun packages, rustup with the Rust toolchains it manages and a set
+# of AI coding CLIs in one run. Every step is a job that starts the
+# moment the jobs it builds on have finished, so everything that can
+# run at the same time does:
 #
 #   apt ─────────────────────────→ AI CLIs installed by apt
 #   node ─→ npm ─→ npm -g
 #               └────────────────→ AI CLIs installed by npm
 #   bun ──→ bun -g (after node too)
 #       └────────────────────────→ AI CLIs installed by bun
+#   rustup (after apt, when apt installed it) ─→ rust toolchains
 #   AI CLIs with installers of their own, from the start
 #
 # The registry and release queries all go out first, while the sudo
@@ -44,6 +46,7 @@ _UUA_VERBOSE=0
 # _UUA_FILTERED marks that at least one was given.
 _UUA_WANT_APT=0
 _UUA_WANT_NODE=0
+_UUA_WANT_RUST=0
 _UUA_WANT_AI=0
 _UUA_FILTERED=0
 
@@ -111,14 +114,14 @@ _init_colors() {
       _UUA_GC=(
         total  $'\033[38;5;45m'   system $'\033[38;5;214m'
         node   $'\033[38;5;77m'   bun    $'\033[38;5;211m'
-        ai     $'\033[38;5;141m'  failed $'\033[38;5;203m'
-        track  $'\033[38;5;240m'
+        rust   $'\033[38;5;166m'  ai     $'\033[38;5;141m'
+        failed $'\033[38;5;203m'  track  $'\033[38;5;240m'
       )
     else
       _UUA_GC=(
         total  $'\033[96m'  system $'\033[93m'  node  $'\033[92m'
-        bun    $'\033[95m'  ai     $'\033[94m'  failed $'\033[91m'
-        track  $'\033[90m'
+        bun    $'\033[95m'  rust   $'\033[31m'  ai    $'\033[94m'
+        failed $'\033[91m'  track  $'\033[90m'
       )
     fi
   else
@@ -749,6 +752,21 @@ _bun_latest() {
   )"
 
   [[ -n "$tag" ]] && print -r -- "${tag#bun-v}"
+}
+
+
+# The latest rustup release, from the channel rustup itself follows when
+# it self-updates (RUSTUP_UPDATE_ROOT points it at a mirror). The file
+# names one version, quoted either way TOML allows.
+_rustup_latest() {
+  local root="${RUSTUP_UPDATE_ROOT:-https://static.rust-lang.org/rustup}"
+
+  command -v curl >/dev/null 2>&1 || return 1
+
+  curl -fsSL --max-time 20 --retry 2 "$root/release-stable.toml" 2>/dev/null |
+    grep -Eo "^version[[:space:]]*=[[:space:]]*['\"]?[0-9]+(\.[0-9]+){1,3}" |
+    grep -Eo "$_UUA_VER_RE" |
+    head -n 1
 }
 
 
@@ -1849,6 +1867,181 @@ _step_bun() {
 
 
 # ─────────────────────────────────────────────────────────────
+# Jobs: rustup / Rust
+# ─────────────────────────────────────────────────────────────
+
+# True when rustup is there to work with: on PATH, or where its own
+# installer puts it when the invoking shell has not picked that up (a
+# cron job, say). Each job resolves it in its own subshell.
+_load_rustup() {
+  local bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+
+  command -v rustup >/dev/null 2>&1 && return 0
+
+  if [[ -x "$bin/rustup" ]]; then
+    PATH="$bin:$PATH"
+    rehash 2>/dev/null
+  fi
+
+  command -v rustup >/dev/null 2>&1
+}
+
+
+# The installed toolchains as rustup names them, the "(default)" and
+# "(active)" markers after the name left off. A name has no spaces in
+# it; the markers, and the banner an empty list prints instead of one,
+# do.
+_rustup_toolchains() {
+  local line
+
+  for line in "${(@f)$(rustup toolchain list 2>/dev/null)}"; do
+    case "$line" in
+      *' ('*) line="${line%% *}" ;;
+      *' '*)  continue ;;
+    esac
+
+    print -r -- "$line"
+  done
+}
+
+
+_step_rustup() {
+  local log="$_UUA_RUN_DIR/rustup"
+  local current latest
+
+  if ! _load_rustup; then
+    _row absent "rustup not installed"
+    return 0
+  fi
+
+  # A rustup a package manager shipped cannot replace itself; one from
+  # apt has just been handled by the apt job.
+  if _is_apt_managed rustup; then
+    current="$(_uua_ver rustup --version)"
+    _row ok "${current:-unknown} · managed by apt"
+    _mark_uptodate
+    return 0
+  fi
+
+  command -v curl >/dev/null 2>&1 ||
+    { _step_error "curl is needed to check for releases"; return }
+
+  current="$(_uua_ver rustup --version)"
+
+  _phase 0 0.3 1
+  _activity "checking the latest release"
+  latest="$(_fetch rustup-latest "$_UUA_QUERY_LIMIT" _rustup_latest)"
+
+  [[ -n "$current" && -n "$latest" ]] ||
+    { _step_error "unable to detect the version"; return }
+
+  _needs_install "$current" "$latest" || return 0
+
+  _phase 0.3 0.95 6
+  _run_task "updating to $latest" "$log-install.log" "$_UUA_INSTALL_LIMIT" \
+    rustup self update ||
+    { _step_error "self-update failed" "$log-install.log"; return }
+
+  rehash 2>/dev/null
+  _finish_upgrade "$current" "$(_uua_ver rustup --version)" "" "$log-install.log"
+}
+
+
+# The lines "rustup update" ends with, one per toolchain: padded into
+# columns, so the leading spaces vary, and everything after the " - "
+# that follows the banner. "   stable-...-gnu updated - 1.89.0 (...)
+# (from 1.88.0 (...))" becomes "stable-...-gnu 1.89.0 (...) (from ...)".
+# $1 is the banner to keep (updated, installed).
+_rust_banners() {
+  sed -nE "s/^ +([^ ]+) ($1) - /\1 /p" "$2" 2>/dev/null
+}
+
+
+_step_rust() {
+  local log="$_UUA_RUN_DIR/rust"
+  local rc line
+  local -a chains moved
+
+  if ! _load_rustup; then
+    _row absent "rustup not installed"
+    return 0
+  fi
+
+  _phase 0 0.1 0.5
+  _activity "listing toolchains"
+  chains=(${(f)"$(_rustup_toolchains)"})
+
+  if (( ! $#chains )); then
+    _row absent "no toolchains installed"
+    return 0
+  fi
+
+  if (( _UUA_CHECK_ONLY )); then
+    _phase 0.1 0.95 5
+    _run_task "checking for toolchain updates" "$log-check.log" \
+      "$_UUA_INSTALL_LIMIT" rustup check
+    rc=$?
+
+    # The exit status says what happened (1.29 leaves 0 when everything
+    # is current and 100 when not, like uua --check; older releases
+    # always 0), so the lines decide what to report. The status text
+    # moved between releases ("update available:", "Update available
+    # : "), so both spellings are taken, and the "rustup - ..." line is
+    # the rustup job's, not this one's.
+    if (( rc != 0 && rc != 100 )); then
+      _step_error "unable to check for updates" "$log-check.log"
+      return
+    fi
+
+    moved=(${(f)"$(
+      sed -nE 's/^([^ ]+) - [Uu]pdate available *: /\1 /p' "$log-check.log" |
+        grep -v '^rustup '
+    )"})
+
+    if (( ! $#moved )); then
+      _row ok "up to date"
+      _mark_uptodate
+      return 0
+    fi
+
+    _row available "$#moved update(s) available"
+
+    for line in $moved; do
+      _sub available "$line"
+    done
+
+    _mark_available
+    return 0
+  fi
+
+  # Every toolchain in one run, so the whole sweep gets the worker
+  # limit the help text promises, not one install limit for them all.
+  _phase 0.1 0.9 8
+  _run_task "updating $#chains toolchain(s)" "$log-update.log" \
+    "$_UUA_WORKER_LIMIT" rustup update --no-self-update ||
+    { _step_error "update failed" "$log-update.log"; return }
+
+  # The banners rustup printed say what moved; a toolchain it could not
+  # update makes it exit non-zero, which the task above already caught.
+  moved=(${(f)"$(_rust_banners 'updated|installed' "$log-update.log")"})
+
+  if (( ! $#moved )); then
+    _row ok "up to date"
+    _mark_uptodate
+    return 0
+  fi
+
+  _row updated "$#moved toolchain(s) upgraded"
+
+  for line in $moved; do
+    _sub updated "$line"
+  done
+
+  _mark_updated
+}
+
+
+# ─────────────────────────────────────────────────────────────
 # Jobs: global packages
 # ─────────────────────────────────────────────────────────────
 
@@ -2337,6 +2530,18 @@ _plan_build() {
     _plan_add bun-g bun "bun -g" "bun node" _step_bun_globals
   fi
 
+  if _group_enabled _UUA_WANT_RUST; then
+    _plan_add rustup rust rustup "" _step_rustup
+    _plan_add rust rust rust rustup _step_rust "$_UUA_WORKER_LIMIT"
+
+    _tool_owner rustup
+    _UUA_J_OWNER[rustup]="$REPLY"
+
+    # A rustup apt owns has just been updated by the apt job; this one
+    # waits before reporting it managed.
+    [[ "$REPLY" == apt ]] && _UUA_J_DEPS[rustup]=apt
+  fi
+
   if _group_enabled _UUA_WANT_AI; then
     for row in $_UUA_TOOLS; do
       _tool_fields "$row"
@@ -2383,6 +2588,13 @@ _prefetch_all() {
 
     command -v bun >/dev/null 2>&1 &&
       _prefetch bun-latest "$_UUA_QUERY_LIMIT" _bun_latest
+  fi
+
+  if (( ${+_UUA_J_NAME[rustup]} )); then
+    # A rustup a package manager owns follows its releases, not the
+    # channel it self-updates from.
+    [[ "$_UUA_J_OWNER[rustup]" != (absent|apt) ]] &&
+      _prefetch rustup-latest "$_UUA_QUERY_LIMIT" _rustup_latest
   fi
 
   for row in $_UUA_TOOLS; do
@@ -3463,7 +3675,8 @@ _usage() {
 UUA $UUA_VERSION — Universal Update All
 
 Updates APT packages, Node.js (through nvm), npm, Bun, the global
-npm/bun packages and a set of AI coding CLIs in one run.
+npm/bun packages, rustup with the Rust toolchains it manages and a set
+of AI coding CLIs in one run.
 
 Usage: uua [options]
 
@@ -3478,6 +3691,7 @@ Options:
   --apt         Only the APT group
   --node        Only the Node.js group: node, npm, bun and the global
                 npm/bun packages
+  --rust        Only the Rust group: rustup and the toolchains it manages
   --ai          Only the AI CLI group
   --verbose     Show the output of every command as it runs, each line
                 prefixed with the log it comes from ("[npm-install]",
@@ -3497,6 +3711,7 @@ How it runs:
     apt
     node → npm → npm globals
     bun → bun globals (after node too: it looks packages up with npm)
+    rustup → rust toolchains (after apt too, when apt installed rustup)
     AI CLIs (${(j:, :)labels}): from the start when they
       update themselves; after apt, npm or bun when that package
       manager installed them
@@ -3506,8 +3721,8 @@ How it runs:
 
   On a terminal a live board shows each job's state, what it is doing
   and the latest line of its log, and a progress bar in the color of its
-  group (apt, node, bun, AI CLIs), under a bar for the whole run; the
-  last frame stays, with the details. Elsewhere each job prints once,
+  group (apt, node, bun, rust, AI CLIs), under a bar for the whole run;
+  the last frame stays, with the details. Elsewhere each job prints once,
   when it finishes.
 
 AI CLIs:
@@ -3522,6 +3737,13 @@ Node.js:
   the later jobs then update the pinned Node, the one new shells get.
   nvm itself is not updated: it has no self-update command.
 
+Rust:
+  Updates rustup itself ("rustup self update"), then the toolchains
+  it tracks ("rustup update --no-self-update"): stable, beta, nightly
+  and the like. Toolchains pinned to an exact release and binaries
+  installed with "cargo install" are left alone. A rustup apt owns is
+  left to apt.
+
 Global packages:
   Every npm -g and bun -g package installed from a registry, except
   the ones the jobs above own. Linked, local and git packages are left
@@ -3532,7 +3754,7 @@ Removal:
   --prune would remove.
 
 Time limits:
-  ${_UUA_QUERY_LIMIT}s per version query, $(( _UUA_INSTALL_LIMIT / 60 ))min per install, $(( _UUA_WORKER_LIMIT / 60 ))min per AI CLI. APT has
+  ${_UUA_QUERY_LIMIT}s per version query, $(( _UUA_INSTALL_LIMIT / 60 ))min per install, $(( _UUA_WORKER_LIMIT / 60 ))min per AI CLI or Rust update. APT has
   none: Ctrl-C cancels downloads, but waits for dpkg to stop safely
   if installation has already started.
 
@@ -3630,6 +3852,7 @@ main() {
       --verbose)   _UUA_VERBOSE=1 ;;
       --apt)       _UUA_WANT_APT=1 _UUA_FILTERED=1 ;;
       --node)      _UUA_WANT_NODE=1 _UUA_FILTERED=1 ;;
+      --rust)      _UUA_WANT_RUST=1 _UUA_FILTERED=1 ;;
       --ai)        _UUA_WANT_AI=1 _UUA_FILTERED=1 ;;
 
       --version)
@@ -3700,6 +3923,11 @@ main() {
 
     _resolve_npm_root
   fi
+
+  # Rust does not depend on the shell's environment the way nvm does;
+  # rustup is only resolved once so the plan and the prefetches see the
+  # one the jobs then use.
+  _group_enabled _UUA_WANT_RUST && _load_rustup
 
   _plan_build
   _prefetch_all

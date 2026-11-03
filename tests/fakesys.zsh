@@ -1,12 +1,12 @@
 #!/usr/bin/env zsh
 
 # Builds a fake system for uua under directory $1: stub apt-get, sudo,
-# curl and dpkg-query, an nvm with Node 22 installed and 24 out, npm, Bun
-# and the four AI CLIs, each with an update waiting and a pause where the
-# real one would download. `make demo` runs uua against it, and the tests
-# drive it; nothing outside $1 is touched. FAKE_SPEED scales the pauses
-# (1 is demo speed). Run uua with the environment `fakesys.zsh $1 env`
-# prints.
+# curl and dpkg-query, an nvm with Node 22 installed and 24 out, npm, Bun,
+# the four AI CLIs and rustup with two toolchains, each with an update
+# waiting and a pause where the real one would download. `make demo` runs
+# uua against it, and the tests drive it; nothing outside $1 is touched.
+# FAKE_SPEED scales the pauses (1 is demo speed). Run uua with the
+# environment `fakesys.zsh $1 env` prints.
 
 F="${1:?usage: fakesys.zsh <dir> [env]}"
 
@@ -55,12 +55,18 @@ put "$F/latest/@anthropic-ai/claude-code" 2.1.0
 put "$F/latest/codex" 0.50.0
 put "$F/latest/@opencode/cli" 1.1.0
 put "$F/latest/@earendil-works/pi-coding-agent" 1.0.0
+put "$F/latest/rustup" 1.29.0
+put "$F/latest/rust-stable" 1.99.0
+put "$F/latest/rust-nightly" 1.104.0-nightly
 
 put "$F/db/apt-pending" 12
 put "$F/db/apt-unused" 2
 put "$F/db/bun" 1.1.0
 put "$F/db/claude" 2.0.0
 put "$F/db/codex" 0.50.0
+put "$F/db/rustup" 1.28.0
+put "$F/db/rust-stable" 1.98.0
+put "$F/db/rust-nightly" 1.103.0-nightly
 
 put "$MODS/npm/version" 10.0.0
 put "$MODS/typescript/version" 5.0.0
@@ -148,6 +154,9 @@ case "$url" in
   */claude-code-releases/latest)
     nap 0.6
     cat @F@/latest/@anthropic-ai/claude-code ;;
+  */rustup/release-stable.toml)
+    nap 0.4
+    printf "schema-version = '1'\nversion = '%s'\n" "$(cat @F@/latest/rustup)" ;;
   *)
     exit 22 ;;
 esac
@@ -330,6 +339,56 @@ case "$1" in
     echo "Upgrading opencode..."; nap 1
     printf '{"version": "%s"}\n' "$(cat @F@/latest/@opencode/cli)" >"$dir/package.json"
     echo "Upgrade complete" ;;
+esac
+EOF
+
+
+# rustup, where its installer puts it and off the fake PATH, so uua has
+# to find it there. Two toolchains, each a release behind.
+script_to "$F/home/.cargo/bin/rustup" <<'EOF'
+#!/bin/sh
+. @F@/lib.sh
+
+case "$1 $2" in
+  "--version ")
+    echo "rustup $(cat @F@/db/rustup) (e6f2f6dcd 2026-01-01)" ;;
+  "self update")
+    echo "info: checking for self-updates"
+    nap 0.4
+    for p in 25 50 75 100; do echo "######################## $p.0%"; nap 0.15; done
+    cat @F@/latest/rustup >@F@/db/rustup
+    echo "info: self update finished" ;;
+  "toolchain list")
+    echo "stable-x86_64-unknown-linux-gnu (active, default)"
+    echo "nightly-x86_64-unknown-linux-gnu" ;;
+  "check ")
+    code=0
+    for t in stable nightly; do
+      cur=$(cat @F@/db/rust-$t)
+      new=$(cat @F@/latest/rust-$t)
+      if [ "$cur" = "$new" ]; then
+        echo "$t-x86_64-unknown-linux-gnu - up to date: $cur (hash 2026-02-01)"
+      else
+        echo "$t-x86_64-unknown-linux-gnu - update available: $cur (hash 2026-01-01) -> $new (hash 2026-02-01)"
+        code=100
+      fi
+    done
+    cur=$(cat @F@/db/rustup)
+    new=$(cat @F@/latest/rustup)
+    [ "$cur" = "$new" ] || { echo "rustup - update available : $cur -> $new"; code=100; }
+    exit $code ;;
+  "update --no-self-update")
+    for t in stable nightly; do
+      echo "info: syncing channel updates for '$t-x86_64-unknown-linux-gnu'" >&2
+      cur=$(cat @F@/db/rust-$t)
+      new=$(cat @F@/latest/rust-$t)
+      for p in 25 50 75 100; do echo "  $p.0%"; nap 0.15; done
+      pad=""
+      [ "$t" = stable ] && pad=" "
+      echo "  $pad$t-x86_64-unknown-linux-gnu updated - $new (hash 2026-02-01) (from $cur (hash 2026-01-01))"
+      cat @F@/latest/rust-$t >@F@/db/rust-$t
+    done
+    echo "info: cleaning up downloads & temporaries" >&2 ;;
 esac
 EOF
 
