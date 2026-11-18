@@ -279,6 +279,64 @@ printf 2.0.0'
 expect "claude channel: a dropped request is retried" 2.0.0 "$(_claude_latest)"
 
 
+# ── Antigravity CLI's release manifest ──────────────────────
+
+stub curl '
+for a; do case "$a" in http*) url=$a ;; esac; done
+echo "$url" >"'"$TMP"'/agy-url"
+case "$url" in
+  */manifests/linux_amd64.json)      printf "{\"version\": \"1.6.0\", \"url\": \"https://example.com/a.tar.gz\"}\n" ;;
+  */manifests/linux_arm64.json)      printf "{\"version\":\"v1.6.1\"}\n" ;;
+  */manifests/linux_amd64_musl.json) printf "{\"version\": \"1.6.2\"}\n" ;;
+  */manifests/linux_arm64_musl.json) printf "{\"version\": \"1.6.3\"}\n" ;;
+  *) exit 22 ;;
+esac'
+
+_UUA_LIB_DIR="$TMP/agy-lib"
+mkdir -p "$_UUA_LIB_DIR"
+
+stub uname 'echo x86_64'
+stub ldd 'echo "ldd (Ubuntu GLIBC 2.39)"'
+rehash
+
+expect "agy manifest: x86_64 glibc" 1.6.0 "$(_agy_latest)"
+expect "agy manifest: linux_amd64 URL" yes \
+  "$(has "$(<"$TMP/agy-url")" "/manifests/linux_amd64.json")"
+
+stub uname 'echo aarch64'
+expect "agy manifest: aarch64 and v prefix" 1.6.1 "$(_agy_latest)"
+
+touch "$_UUA_LIB_DIR/libc.musl-x86_64.so.1"
+stub uname 'echo x86_64'
+expect "agy manifest: musl from /lib/libc.musl" 1.6.2 "$(_agy_latest)"
+rm -f "$_UUA_LIB_DIR/libc.musl-x86_64.so.1"
+
+stub uname 'echo arm64'
+stub ldd 'echo "musl libc (aarch64)" >&2; exit 1'
+expect "agy manifest: musl from ldd" 1.6.3 "$(_agy_latest)"
+
+stub uname 'echo riscv64'
+expect "agy manifest: unsupported arch" "" "$(_agy_latest)"
+
+stub uname 'echo x86_64'
+stub curl 'exit 22'
+expect "agy manifest: unreachable" "" "$(_agy_latest)"
+
+_UUA_LIB_DIR=/lib
+rm -f "$TMP/bin/uname" "$TMP/bin/ldd"
+rehash
+
+# AI CLI table order: Claude Code, Codex, Antigravity, OpenCode, Pi.
+tool_order=()
+for row in $_UUA_TOOLS; do
+  _tool_fields "$row"
+  tool_order+=("$reply[1]:$reply[2]")
+done
+expect "tools: order and labels" \
+  "claude:Claude Code|codex:Codex|agy:Antigravity|opencode:OpenCode|pi:Pi" \
+  "${(j:|:)tool_order}"
+
+
 # ── AI CLI workers ──────────────────────────────────────────
 
 _UUA_RUN_DIR="$TMP/run"
@@ -1045,11 +1103,11 @@ fake_run() {
 F="$TMP/fake"
 out="$(fake_run "$F" FAKE_SPEED=0.1 zsh "$ROOT/uua" --prune)"
 expect "run: succeeds" 0 $?
-expect "run: the header, without the version" "UUA · 13 jobs" "${${(f)out}[1]}"
+expect "run: the header, without the version" "UUA · 14 jobs" "${${(f)out}[1]}"
 
 mods="$F/home/.nvm/versions/node/v24.1.0/lib/node_modules"
-expect "run: every tool upgraded" "0 1.2.0 2.1.0 1.0.0 10.2.0 5.1.0" \
-  "$(<"$F/db/apt-pending") $(<"$F/db/bun") $(<"$F/db/claude") $(<"$mods/@earendil-works/pi-coding-agent/version") $(<"$mods/npm/version") $(<"$mods/typescript/version")"
+expect "run: every tool upgraded" "0 1.2.0 2.1.0 1.6.0 1.0.0 10.2.0 5.1.0" \
+  "$(<"$F/db/apt-pending") $(<"$F/db/bun") $(<"$F/db/claude") $(<"$F/db/agy") $(<"$mods/@earendil-works/pi-coding-agent/version") $(<"$mods/npm/version") $(<"$mods/typescript/version")"
 expect "run: rustup and both toolchains upgraded" "1.29.0 1.99.0 1.104.0-nightly" \
   "$(<"$F/db/rustup") $(<"$F/db/rust-stable") $(<"$F/db/rust-nightly")"
 expect "run: bun globals and bun's CLI" yes \

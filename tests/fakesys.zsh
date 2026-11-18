@@ -2,7 +2,7 @@
 
 # Builds a fake system for uua under directory $1: stub apt-get, sudo,
 # curl and dpkg-query, an nvm with Node 22 installed and 24 out, npm, Bun,
-# the four AI CLIs and rustup with two toolchains, each with an update
+# the five AI CLIs and rustup with two toolchains, each with an update
 # waiting and a pause where the real one would download. `make demo` runs
 # uua against it, and the tests drive it; nothing outside $1 is touched.
 # FAKE_SPEED scales the pauses (1 is demo speed). Run uua with the
@@ -53,6 +53,7 @@ put "$F/latest/typescript-language-server" 4.1.0
 put "$F/latest/bun" 1.2.0
 put "$F/latest/@anthropic-ai/claude-code" 2.1.0
 put "$F/latest/codex" 0.50.0
+put "$F/latest/agy" 1.6.0
 put "$F/latest/@opencode/cli" 1.1.0
 put "$F/latest/@earendil-works/pi-coding-agent" 1.0.0
 put "$F/latest/rustup" 1.29.0
@@ -64,6 +65,7 @@ put "$F/db/apt-unused" 2
 put "$F/db/bun" 1.1.0
 put "$F/db/claude" 2.0.0
 put "$F/db/codex" 0.50.0
+put "$F/db/agy" 1.5.0
 put "$F/db/rustup" 1.28.0
 put "$F/db/rust-stable" 1.98.0
 put "$F/db/rust-nightly" 1.103.0-nightly
@@ -98,6 +100,18 @@ EOF
 script_to "$F/bin/dpkg-query" <<'EOF'
 #!/bin/sh
 exit 1
+EOF
+
+
+script_to "$F/bin/uname" <<'EOF'
+#!/bin/sh
+echo x86_64
+EOF
+
+
+script_to "$F/bin/ldd" <<'EOF'
+#!/bin/sh
+echo "ldd (GNU libc) 2.39"
 EOF
 
 
@@ -151,6 +165,9 @@ case "$url" in
   */codex/channels/latest)
     nap 0.6
     printf '{"tag_name": "rust-v%s"}\n' "$(cat @F@/latest/codex)" ;;
+  */manifests/linux_*.json)
+    nap 0.5
+    printf '{"version": "%s"}\n' "$(cat @F@/latest/agy)" ;;
   */claude-code-releases/latest)
     nap 0.6
     cat @F@/latest/@anthropic-ai/claude-code ;;
@@ -301,6 +318,24 @@ script_to "$F/home/.local/bin/codex" <<'EOF'
 case "$1" in
   --version) echo "codex-cli $(cat @F@/db/codex)" ;;
   update) nap 1; cat @F@/latest/codex >@F@/db/codex ;;
+esac
+EOF
+
+
+script_to "$F/home/.local/bin/agy" <<'EOF'
+#!/bin/sh
+. @F@/lib.sh
+case "$1" in
+  --version) cat @F@/db/agy ;;
+  update)
+    echo "Checking for updates... (current version $(cat @F@/db/agy))"
+    nap 0.4
+    echo "Found new version $(cat @F@/latest/agy)."
+    echo "Downloading update..."; nap 0.6
+    echo "Extracting files..."; nap 0.3
+    echo "Installing update..."; nap 0.2
+    cat @F@/latest/agy >@F@/db/agy
+    echo "Update successful! Please restart agy." ;;
 esac
 EOF
 

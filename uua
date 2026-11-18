@@ -58,11 +58,12 @@ _UUA_UPDATED=0
 _UUA_AVAILABLE=0
 _UUA_FAILED_STEPS=0
 
-# Notes printed after the summary, and the file packages write to ask
-# for a reboot.
+# Notes printed after the summary, and system paths the tests point at
+# a scratch directory.
 _UUA_NODE_CHANGED=0
 _UUA_REBOOT=0
 _UUA_REBOOT_FLAG=/var/run/reboot-required
+_UUA_LIB_DIR=/lib
 
 # Run state
 _UUA_LOG_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/uua"
@@ -704,6 +705,34 @@ _codex_latest() {
   curl -fsSL --max-time 20 --retry 2 \
     https://releases.openai.com/codex/channels/latest 2>/dev/null |
     grep -Eo '"tag_name"[[:space:]]*:[[:space:]]*"rust-v[^"]+"' |
+    grep -Eo "$_UUA_VER_RE" |
+    head -n 1
+}
+
+
+# Antigravity CLI updates from its own per-platform release manifest,
+# choosing the _musl variant the same way "agy update" does.
+_agy_latest() {
+  local arch suffix=""
+
+  command -v curl >/dev/null 2>&1 || return 1
+
+  case "$(uname -m 2>/dev/null)" in
+    x86_64|amd64)  arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *)             return 1 ;;
+  esac
+
+  if [[ -e "$_UUA_LIB_DIR/libc.musl-x86_64.so.1" ||
+    -e "$_UUA_LIB_DIR/libc.musl-aarch64.so.1" ]] ||
+    { command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl }
+  then
+    suffix=_musl
+  fi
+
+  curl -fsSL --max-time 20 --retry 2 \
+    "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_${arch}${suffix}.json" 2>/dev/null |
+    grep -Eo '"version"[[:space:]]*:[[:space:]]*"v?[^"]+"' |
     grep -Eo "$_UUA_VER_RE" |
     head -n 1
 }
@@ -2165,6 +2194,7 @@ _codex_prune() {
 _UUA_TOOLS=(
   'claude|Claude Code|claude|npm:@anthropic-ai/claude-code|auto|claude update||||_claude_latest'
   'codex|Codex|codex|_codex_latest|self|codex update|||_codex_prune|'
+  'agy|Antigravity|agy|_agy_latest|self|agy update||||'
   'opencode|OpenCode|opencode|npm:@opencode/cli|auto|opencode upgrade||_repair_opencode||'
   'pi|Pi|pi|npm:@earendil-works/pi-coding-agent|self|pi update --self|pi update --extensions|||'
 )
@@ -3753,9 +3783,9 @@ How it runs:
     node → npm → npm globals
     bun → bun globals (after node too: it looks packages up with npm)
     rustup → rust toolchains (after apt too, when apt installed rustup)
-    AI CLIs (${(j:, :)labels}): from the start when they
-      update themselves; after apt, npm or bun when that package
-      manager installed them
+    AI CLIs (${(j:, :)labels}):
+      from the start when they update themselves; after apt, npm or bun
+      when that package manager installed them
   With --prune, old Node.js releases are removed last. --check changes
   nothing, so every job starts at once. The registry and release
   queries all go out first, while the sudo password is typed.
