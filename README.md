@@ -1,186 +1,85 @@
 # UUA — Universal Update All
 
-Updates APT packages, Node.js (through nvm), npm, Bun, the global
-npm/bun packages, rustup with the Rust toolchains it manages and a set
-of AI coding CLIs in one run. A single zsh script (`uua`).
+English | [简体中文](README_zh.md)
 
-## How it runs
+Update APT packages, Node.js, npm, Bun, global npm/bun packages, Rust toolchains, and AI coding CLIs in one parallel run.
 
-Every step is a job, and a job starts the moment the jobs it builds on
-have finished, so everything that can run at the same time does:
+![UUA live terminal demo](assets/demo.svg)
 
-```
-apt ─────────────────────────────→ AI CLIs installed by apt
-node ──→ npm ──→ npm -g
-              └──────────────────→ AI CLIs installed by npm
-bun ───→ bun -g   (after node too)
-     └───────────────────────────→ AI CLIs installed by bun
-rustup ─→ rust toolchains   (after apt too, when apt installed rustup)
-AI CLIs with installers of their own, from the start
-```
+## What It Updates
 
-APT, the Node.js chain, the Bun chain, the rustup chain and
-self-updating CLIs such as a native Claude Code or Codex all run side
-by side. A CLI that npm or Bun installed waits for that package
-manager's own update, then shares its global tree with the sweep under
-a lock. With `--prune`, old Node.js releases go last, once nothing can
-be running one; `--check` changes nothing, so every job starts at once.
-The registry and release queries all go out first, while the sudo
-password is typed.
+- **System**: APT packages on Debian/Ubuntu (`apt-get update` & `upgrade`)
+- **Node.js & Bun**: Latest Node.js LTS via `nvm` (respecting pinned `default` aliases), `npm`, `bun`, and global registry packages (`npm -g`, `bun -g`)
+- **Rust**: `rustup` and tracked toolchains (`stable`, `beta`, `nightly`, etc.; pinned versions and `cargo install` binaries are left untouched)
+- **AI Coding CLIs**: Claude Code (`claude`), Codex (`codex`), Antigravity (`agy`), OpenCode (`opencode`), and Pi (`pi` + extensions)
 
-On a terminal a live board shows every job: its state, what it is doing
-and the latest line of its log, a progress bar and its time, under a bar
-for the whole run. A bar only ever grows: each job counts its progress
-from what its commands print (packages set up, download percentages) or
-eases it in over time, and fills when the job is done. The bars are a
-line in each group's color (apt, node, bun, rust, AI CLIs, and the run)
-over a faint one; without colors, as here midway through a run, "=" over
-"-":
-
-```
- ⠴ UUA  =====================================================----------------------  7/13  3.5s
-
- SYSTEM ⠦  apt          installing 12 update(s)  Unpacking libfake…  ==========---------   3.0s
- NODE   ↑  node         22.0.0 → 24.1.0 · upgraded                   ===================   1.6s
-        ↑  npm          10.0.0 → 10.2.0 · upgraded                   ===================   0.7s
-        ⠏  npm -g       updating typescript                          ========-----------   0.6s
-        ◌  prune        waiting for 4 jobs                           -------------------
- BUN    ↑  bun          1.1.0 → 1.2.0 · upgraded                     ===================   1.6s
-        ⠹  bun -g       updating typescript-language-server  insta…  =========----------   1.3s
- RUST   ↑  rustup       1.28.2 → 1.29.2 · upgraded                   ===================   0.9s
-        ⠦  rust         updating 2 toolchain(s)  45.0%               =========----------   0.6s
- AI     ↑  Claude Code  2.0.0 → 2.1.0 · upgraded                     ===================   2.3s
-        ✓  Codex        0.50.0 · up to date                          ===================   0.3s
-        ↑  OpenCode     1.0.0 → 1.1.0 · upgraded                     ===================   1.1s
-        ⠦  Pi           updating to 1.0.0  Updating pi...            ======-------------   0.6s
-```
-
-The last frame stays, with each job's details under its row, followed by
-how much the jobs overlapped. The board adapts to the terminal: it asks
-whether line characters are drawn two columns wide (a CJK setting) and
-falls back to "-" if so, and it never lets a row wrap.
-
-Without a terminal (a pipe, a log, cron) each job prints once, when it
-finishes. `make demo` shows the board on a fake system, updating nothing.
+Tools that are not installed on your machine are silently skipped. Independent steps run in parallel on a live terminal progress board (or print one summary line per job when piped or logged). `sudo` is requested once up front, and only when the APT group runs (outside `--check`).
 
 ## Requirements
 
-- Linux with **zsh** 5.x. APT updates need a Debian or Ubuntu system;
-  elsewhere that step is skipped.
-- `flock` (util-linux) and `timeout` (coreutils), present on every
-  Debian/Ubuntu install.
-- Each step covers a tool only when it is installed: nvm for Node.js, npm,
-  bun, rustup, and any of Claude Code, Codex, OpenCode and Pi. Missing
-  tools are skipped without being listed.
-
-macOS is not supported.
+- **Linux** with `zsh` 5.0+, `curl`, `flock` (`util-linux`), and `timeout` (`coreutils`).
+- macOS is not supported.
 
 ## Install
 
-On Linux, run this as your normal user (not with `sudo`):
+Run as your normal user (not with `sudo`):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/roy-tian/uua/master/install.sh | sh
 ```
 
-The installer downloads the latest `master` version to `~/.local/bin/uua`,
-validates it before replacing an existing installation, and adds a PATH
-entry to `.bashrc` for Bash, `${ZDOTDIR:-$HOME}/.zshrc` for Zsh (resolved after
-loading `.zshenv`, even when `ZDOTDIR` is not exported), or `.profile`
-for other shells. Open a new terminal afterward, or run
-`~/.local/bin/uua --check` immediately. Shells that do not read these files
-(such as Fish) need their own PATH configuration.
+The installer places `uua` in `~/.local/bin/uua`, installs missing runtime dependencies via APT on Debian/Ubuntu if needed, and adds `~/.local/bin` to `PATH` in `.bashrc`, `.zshrc`, or `.profile` (shells like Fish need manual `PATH` configuration).
 
-On Debian/Ubuntu it installs missing `zsh`, `curl`, `flock` and `timeout`
-dependencies through APT, requesting sudo only when needed. On other Linux
-distributions it reports the missing packages for you to install. It does
-not install Node.js, Bun or AI CLIs, and does not run UUA's update pipeline.
-The command above needs `curl` already installed; alternatively, download
-[`install.sh`](install.sh) with your browser and run `sh install.sh`.
-As with any downloaded installer, review the script before running it.
+- **Upgrade UUA**: Run the same install command again.
+- **Uninstall**: `rm ~/.local/bin/uua`
 
-**Upgrade UUA:** run the same installer command again. **Uninstall:**
-`rm ~/.local/bin/uua` (the shared PATH entry is left in place).
-
-### From a checkout
+### From a Git Checkout
 
 ```sh
-make install     # copies ./uua to ~/.local/bin/uua
+make install     # installs to ~/.local/bin/uua (override with PREFIX=/usr/local)
 make uninstall
 ```
 
-Make sure `~/.local/bin` is on your `PATH`. `PREFIX=/usr/local make install`
-installs elsewhere. To upgrade, run `git pull --ff-only && make install`.
-
 ## Usage
 
+```sh
+uua                 # update everything installed
+uua --check         # check for available updates without changing anything (no sudo)
+uua --prune         # also remove superseded versions and unused APT packages
+uua --apt           # only APT packages
+uua --node          # only node, npm, bun, and global npm/bun packages
+uua --rust          # only rustup and Rust toolchains
+uua --ai            # only AI coding CLIs
+uua --verbose       # stream live command output above the board
+uua --keep-logs     # keep run logs in ~/.local/state/uua/ (kept automatically on failure)
+uua --no-color      # disable colors (NO_COLOR is also respected)
+uua --help          # full option and behavior reference
 ```
-uua                 run the whole pipeline
-uua --check         report available updates; installs and removes nothing
-uua --prune         also remove superseded releases (see below)
-uua --apt           only APT packages
-uua --node          only node/npm/bun and their global packages
-uua --rust          only rustup and the Rust toolchains it manages
-uua --ai            only the AI CLI tools
-uua --verbose       show every command's output as it runs, above the board
-uua --keep-logs     keep this run's logs (kept anyway on failure)
-uua --no-color      disable colors (so does NO_COLOR)
-```
 
-Group flags combine (`uua --apt --ai`). sudo is asked for once, up front,
-and only when the APT group runs. Every item ends up up to date, upgraded
-or failed, and the summary counts them. `uua --help` has the details.
+- **Combine filters**: Group flags can be combined freely (e.g., `uua --apt --ai`).
+- **Safe cleanup (`--prune`)**: Nothing is removed unless `--prune` is passed. With `--prune`, UUA removes Node.js releases older than the current LTS (keeping `default` and any release used by a running process), older standalone Codex releases, and unused APT packages (`apt-get autoremove`). Rust toolchains are never removed.
+- **Safe interruption (`Ctrl-C`)**: Cancels active jobs and pending APT downloads immediately; if `dpkg` is already running, UUA waits for it to finish safely.
 
-Ctrl-C stops every job, including APT downloads. If APT is already
-running dpkg, uua waits for it to stop safely and starts nothing more.
-The board keeps a stop notice visible while waiting for APT/dpkg;
-without a terminal, the notice is printed once.
-
-### What gets removed
-
-Nothing, unless `--prune` is given. With it, uua removes Node.js releases
-older than the LTS (except the one the nvm `default` alias points at),
-Codex releases other than the current one, and APT packages nothing needs
-(`apt-get autoremove`). A release a running process uses is kept. No
-Rust toolchains are removed, even with `--prune` — a pin such as
-`1.75.0-...` is usually deliberate. Without `--prune`, uua reports what
-it would remove.
-
-The nvm `default` alias moves to `lts/*` only when it is unset, dangling,
-or names the exact release being replaced. A pin (`22`, `lts/iron`,
-`system`, ...) stays, and npm, the global packages and the AI CLIs are then
-updated in the pinned Node, the one new shells get.
-
-### Exit status
+### Exit Codes
 
 | Code | Meaning |
 |------|---------|
-| 0    | everything is up to date or was updated |
-| 1    | something failed, or another uua run is in progress |
-| 2    | invalid option |
-| 100  | `--check` found updates |
-| 130  | interrupted with Ctrl-C |
-
-### Logs
-
-Each run logs to `~/.local/state/uua/run-<time>-<pid>/` (under
-`$XDG_STATE_HOME` if set). The logs are removed after a clean run unless
-`--keep-logs` is given, and only the newest 10 runs are kept.
+| `0` | Everything is up to date or was updated |
+| `1` | A step failed, or another `uua` run is already active |
+| `2` | Invalid command-line option |
+| `100` | Updates are available (`--check`) |
+| `130` | Interrupted with `Ctrl-C` |
 
 ## Development
 
 ```sh
-make link        # symlink ./uua into ~/.local/bin, so edits apply at once
-make check       # shell syntax checks + --version
-make test        # uua and installer tests against stubs (no network, no sudo)
-make demo        # the live board on a fake system; SPEED=0.5 halves pauses
+make link        # symlink ./uua to ~/.local/bin/uua
+make demo        # preview the live board on a fake system (SPEED=0.5 for faster playback)
+make test        # run syntax checks and offline test suite
 ```
 
-The tests and the demo need `node` on `PATH`; the live-board tests run
-when `script` (util-linux) is available.
-
-The version lives in `UUA_VERSION` at the top of `uua`.
+`make demo` and `make test` require `node` on `PATH`.
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
