@@ -39,6 +39,7 @@ zmodload zsh/zselect 2>/dev/null && _UUA_ZSELECT=1
 # Options
 _UUA_CHECK_ONLY=0
 _UUA_PRUNE=0
+_UUA_PRUNE_ONLY=0
 _UUA_KEEP_LOGS=0
 _UUA_NO_COLOR=0
 _UUA_VERBOSE=0
@@ -1338,6 +1339,21 @@ _collect_sudo_password() {
 # Job: APT
 # ─────────────────────────────────────────────────────────────
 
+# True when sudo is installed with live credentials. The password was
+# collected up front; credentials that expired since then are a
+# failure rather than an invisible prompt. The step error is the
+# caller's row, so both apt steps report alike.
+_sudo_ready() {
+  command -v sudo >/dev/null 2>&1 ||
+    { _step_error "sudo not installed"; return 1 }
+
+  sudo -n true 2>/dev/null ||
+    { _step_error "sudo credentials expired (re-run uua)"; return 1 }
+
+  return 0
+}
+
+
 # Unattended by construction: a conffile prompt or a needrestart dialog
 # would block invisibly behind the board, and sudo -n fails rather than
 # prompt. The lock timeout waits out unattended-upgrades instead of
@@ -1447,13 +1463,7 @@ _step_apt() {
     return 0
   fi
 
-  command -v sudo >/dev/null 2>&1 ||
-    { _step_error "sudo not installed"; return }
-
-  # The password was collected up front; credentials that expired since
-  # then are a failure rather than an invisible prompt.
-  sudo -n true 2>/dev/null ||
-    { _step_error "sudo credentials expired (re-run uua)"; return }
+  _sudo_ready || return
 
   # A flag an earlier upgrade left is not this run's to report, only one
   # written while this job changed packages.
@@ -1498,6 +1508,65 @@ _step_apt() {
   fi
 
   _apt_prune "$log-autoremove.log" "$unused"
+
+  _reboot_stamp
+  [[ -n "$REPLY" && "$REPLY" != "$stamp" ]] && _UUA_REBOOT=1
+
+  return 0
+}
+
+
+# The apt share of --prune-only: remove the packages nothing needs
+# (apt-get autoremove) and nothing else. --check counts them against
+# the metadata on disk, the way the update run does.
+_step_apt_prune() {
+  local log="$_UUA_RUN_DIR/apt"
+  local stamp unused=0
+
+  if ! command -v apt-get >/dev/null 2>&1; then
+    _row absent "not available on this system"
+    return 0
+  fi
+
+  if (( _UUA_CHECK_ONLY )); then
+    _phase 0 0.9 1
+    _activity "counting unused packages"
+    unused="$(_apt_unused)"
+
+    if (( unused )); then
+      _row available "$unused package(s) no longer needed · metadata not refreshed"
+      _mark_available
+    else
+      _row ok "no unused packages · metadata not refreshed"
+      _mark_uptodate
+    fi
+
+    return 0
+  fi
+
+  _phase 0 0.3 1
+  _activity "looking for unused packages"
+  unused="$(_apt_unused)"
+
+  # The count needs no root, so sudo is only asked for once there is
+  # something to remove.
+  (( unused )) || { _row ok "no unused packages"; _mark_uptodate; return 0 }
+
+  _sudo_ready || return
+
+  # A flag an earlier upgrade left is not this run's to report, only
+  # one written while this run removed packages.
+  _reboot_stamp
+  stamp="$REPLY"
+
+  _phase 0.3 0.95 5 "Removing" "$unused"
+
+  if _run_task "removing $unused unused package(s)" "$log-autoremove.log" 0 _sudo_apt autoremove; then
+    _row updated "$unused unused package(s) removed"
+    _mark_updated
+  else
+    _step_error "unable to remove $unused unused package(s)" "$log-autoremove.log"
+  fi
 
   _reboot_stamp
   [[ -n "$REPLY" && "$REPLY" != "$stamp" ]] && _UUA_REBOOT=1
@@ -1769,17 +1838,71 @@ _step_node() {
 # Removes the old releases the node job listed: last of all, when no
 # job can still be running one. nvm uninstall also cleans up aliases;
 # it refuses the active version, which the node job moved off these.
+# A --prune-only run has no node job to leave a list, so the step works
+# the stale releases out itself, and its outcome counts in the summary
+# as a job of its own.
 _step_node_prune() {
   local log="$_UUA_RUN_DIR/node-prune.log"
   local list="$_UUA_RUN_DIR/node-stale"
-  local v removed=0 busy=0 failed=0
+  local v target default removed=0 busy=0 failed=0
+  local -a stale removable
 
   if ! _load_nvm; then
     _row absent "nvm not installed"
     return 0
   fi
 
-  [[ -s "$list" ]] || { _row ok "no old Node.js releases"; return 0 }
+  # Without the node job's list, the stale releases are those older
+  # than the installed LTS, with the default's release kept; with no
+  # LTS to compare against, nothing is old.
+  if [[ ! -s "$list" ]]; then
+    if (( ! _UUA_PRUNE_ONLY )); then
+      _row ok "no old Node.js releases"
+      return 0
+    fi
+
+    target="$(_nvm_ver 'lts/*')"
+    default="$(_nvm_ver default)"
+
+    if [[ -n "$target" ]]; then
+      stale=(${(f)"$(_nvm_stale_versions "$target" "$default")"})
+    fi
+
+    if (( _UUA_CHECK_ONLY )); then
+      # What a run would remove, not what it would keep: a release a
+      # running process uses survives the removal loop below.
+      for v in $stale; do
+        _in_use "$NVM_DIR/versions/node/v$v" || removable+=("$v")
+      done
+
+      if (( $#removable )); then
+        _row available "$#removable old release(s): ${(j:, :)removable}"
+        _mark_available
+      elif (( $#stale )); then
+        _row ok "$#stale old release(s) in use; kept"
+        _mark_uptodate
+      else
+        _row ok "no old Node.js releases"
+        _mark_uptodate
+      fi
+
+      return 0
+    fi
+
+    # The node job normally moves the shell off the old releases before
+    # this runs; with no node job, do it here, or nvm refuses to
+    # uninstall the release the invoking shell still has active.
+    if (( $#stale )); then
+      _run_logged "$log" nvm use "$target"
+      print -rl -- $stale >"$list"
+    fi
+  fi
+
+  [[ -s "$list" ]] || {
+    _row ok "no old Node.js releases"
+    _mark_uptodate
+    return 0
+  }
 
   _phase 0 0.95 2
 
@@ -1799,7 +1922,17 @@ _step_node_prune() {
   (( failed )) &&
     { _step_error "unable to remove $failed old release(s)" "$log"; return }
 
-  if (( busy )); then
+  if (( _UUA_PRUNE_ONLY )); then
+    if (( removed )); then
+      (( busy )) &&
+        _row updated "$removed old release(s) removed, $busy in use and kept" ||
+        _row updated "$removed old release(s) removed"
+      _mark_updated
+    else
+      _row ok "$busy old release(s) in use; kept"
+      _mark_uptodate
+    fi
+  elif (( busy )); then
     _row ok "$removed old release(s) removed, $busy in use and kept"
   else
     _row ok "$removed old release(s) removed"
@@ -2130,13 +2263,15 @@ _repair_opencode() {
 
 # Codex's standalone installer never prunes: every release it unpacks
 # stays behind (~320MB each) and only "current" is live. With "count"
-# prints how many releases are stale; with "remove" removes the stale
-# ones no running process uses and prints how many went.
+# prints how many releases a removal would take; with "remove" removes
+# them and prints how many went. A release a running process uses is
+# kept out of both; a removal that fails is not counted, and makes the
+# command fail so the caller can report it.
 _codex_prune() {
   local mode="$1"
   local root="${CODEX_HOME:-$HOME/.codex}/packages/standalone"
   local current dir
-  local n=0
+  local n=0 failed=0
 
   [[ -d "$root/releases" ]] || return 0
 
@@ -2152,8 +2287,14 @@ _codex_prune() {
     [[ -f "$dir/codex-package.json" ]] || continue
 
     if [[ "$mode" == remove ]]; then
-      _in_use "$dir" && continue
-      rm -rf -- "$dir" 2>/dev/null || continue
+      if _in_use "$dir"; then
+        continue
+      elif ! rm -rf -- "$dir"; then
+        (( failed++ ))
+        continue
+      fi
+    elif _in_use "$dir"; then
+      continue
     fi
 
     (( n++ ))
@@ -2161,7 +2302,7 @@ _codex_prune() {
 
   (( n )) && print -r -- "$n"
 
-  return 0
+  return "$failed"
 }
 
 
@@ -2486,16 +2627,27 @@ _report_tool() {
 }
 
 
-# The job for tool $1 of _UUA_TOOLS.
-_job_ai() {
+# The _UUA_TOOLS row of tool key $1, in the caller's $fields array;
+# empty when there is no such tool.
+_tool_row() {
   local row
-  local -a fields
+
+  fields=()
 
   for row in $_UUA_TOOLS; do
     _tool_fields "$row"
     [[ "$reply[1]" == "$1" ]] && { fields=("${reply[@]}"); break }
   done
 
+  return 0
+}
+
+
+# The job for tool $1 of _UUA_TOOLS.
+_job_ai() {
+  local -a fields
+
+  _tool_row "$1"
   (( $#fields )) || { _step_error "unknown tool $1"; return }
 
   (( _UUA_VERBOSE )) &&
@@ -2505,6 +2657,67 @@ _job_ai() {
   _follow_stop
 
   _report_tool "$1"
+}
+
+
+# The --prune-only share of an AI CLI's job: remove the old releases
+# its own installer leaves behind, without checking for or installing
+# an update. Only a tool with a prune command in _UUA_TOOLS is planned
+# for this, and only one no package manager owns.
+_job_ai_prune() {
+  local cmd prune n rc
+  local log="$_UUA_RUN_DIR/$1-prune.log"
+  local -a fields
+
+  _tool_row "$1"
+  (( $#fields )) || { _step_error "unknown tool $1"; return }
+
+  cmd="$fields[3]"
+  prune="$fields[9]"
+
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    _row absent "not installed"
+    return 0
+  fi
+
+  if (( _UUA_CHECK_ONLY )); then
+    _phase 0 0.9 1
+    _activity "counting old releases"
+    n="$(${=prune} count)"
+
+    if [[ -n "$n" ]]; then
+      _row available "$n old release(s)"
+      _mark_available
+    else
+      _row ok "no old releases"
+      _mark_uptodate
+    fi
+
+    return 0
+  fi
+
+  _phase 0 0.95 3
+  _activity "removing old releases"
+  n="$(${=prune} remove 2>"$log")"
+  rc=$?
+
+  if (( rc )); then
+    (( n )) && _sub note "$n old release(s) removed"
+    _step_error "unable to remove the old release(s)" "$log"
+    return 0
+  fi
+
+  if [[ -n "$n" ]]; then
+    _row updated "$n old release(s) removed"
+    _mark_updated
+  else
+    # Nothing removable: any stale release left is one a running
+    # process uses, which the check path says too, by not counting it.
+    _row ok "no old releases"
+    _mark_uptodate
+  fi
+
+  return 0
 }
 
 
@@ -2545,6 +2758,49 @@ _plan_add() {
 
 _plan_build() {
   local row key
+
+  # A --prune-only run plans only the removals: the APT packages
+  # nothing needs, the old Node.js releases and the old releases of an
+  # AI CLI with an installer of its own. Nothing waits for anything,
+  # and the Rust group, whose toolchains are never removed, plans
+  # nothing at all.
+  if (( _UUA_PRUNE_ONLY )); then
+    # The apt job keeps its key: the stop handling that waits for dpkg
+    # to finish safely must cover autoremove too.
+    _group_enabled _UUA_WANT_APT &&
+      _plan_add apt system apt "" _step_apt_prune 0
+
+    _group_enabled _UUA_WANT_NODE &&
+      _plan_add prune node prune "" _step_node_prune 0
+
+    if _group_enabled _UUA_WANT_AI; then
+      for row in $_UUA_TOOLS; do
+        _tool_fields "$row"
+
+        # Only a tool with releases of its own to clean up, installed
+        # by an installer of its own rather than a package manager
+        # that owns its whole tree.
+        [[ -n "$reply[9]" ]] || continue
+
+        key="ai-$reply[1]"
+        _tool_owner "$reply[3]"
+        [[ "$REPLY" == native ]] || continue
+
+        _plan_add "$key" ai "$reply[2]" "" "_job_ai_prune $reply[1]" 0
+        _UUA_J_OWNER[$key]="$REPLY"
+      done
+    fi
+
+    # The same --check rule as below, so a future prune-only job added
+    # with a dependency starts at once in check mode too.
+    if (( _UUA_CHECK_ONLY )); then
+      for key in $_UUA_PLAN; do
+        _UUA_J_DEPS[$key]=""
+      done
+    fi
+
+    return 0
+  fi
 
   _group_enabled _UUA_WANT_APT &&
     _plan_add apt system apt "" _step_apt 0
@@ -2611,6 +2867,10 @@ _plan_build() {
 # Sends out the queries of every planned job at once.
 _prefetch_all() {
   local row key
+
+  # A prune-only run asks nothing remote: every removal is worked out
+  # from what is installed.
+  (( _UUA_PRUNE_ONLY )) && return 0
 
   if (( ${+_UUA_J_NAME[node]} )); then
     command -v nvm >/dev/null 2>&1 &&
@@ -3759,6 +4019,9 @@ Options:
                 releases older than the LTS, Codex releases other than
                 the current one, and APT packages nothing needs. A
                 release a running process uses is kept.
+  --prune-only  Only that removal; nothing is updated or installed.
+                Takes the same group flags; the Rust group has nothing
+                to prune. With --check it reports what would go.
   --apt         Only the APT group
   --node        Only the Node.js group: node, npm, bun and the global
                 npm/bun packages
@@ -3786,9 +4049,10 @@ How it runs:
     AI CLIs (${(j:, :)labels}):
       from the start when they update themselves; after apt, npm or bun
       when that package manager installed them
-  With --prune, old Node.js releases are removed last. --check changes
-  nothing, so every job starts at once. The registry and release
-  queries all go out first, while the sudo password is typed.
+  With --prune, old Node.js releases are removed last. A --prune-only
+  run plans only the removal jobs. --check changes nothing, so every
+  job starts at once. The registry and release queries all go out
+  first, while the sudo password is typed.
 
   A tool this machine does not have is not listed: no row on the
   board, no line in the printout, nothing in the summary.
@@ -3825,7 +4089,8 @@ Global packages:
 
 Removal:
   Nothing is removed without --prune; without it, uua reports what
-  --prune would remove.
+  --prune would remove. --prune-only runs that removal on its own,
+  with no updates around it.
 
 Time limits:
   ${_UUA_QUERY_LIMIT}s per version query, $(( _UUA_INSTALL_LIMIT / 60 ))min per install, $(( _UUA_WORKER_LIMIT / 60 ))min per AI CLI or Rust update. APT has
@@ -3841,7 +4106,7 @@ Exit status:
   0    everything is up to date or was updated
   1    something failed, or another run is in progress
   2    invalid option
-  100  --check found updates
+  100  --check found updates (with --prune-only, things to remove)
   130  interrupted with Ctrl-C
 EOF
 }
@@ -3920,11 +4185,12 @@ main() {
 
   while (( $# > 0 )); do
     case "$1" in
-      --check)     _UUA_CHECK_ONLY=1 ;;
-      --prune)     _UUA_PRUNE=1 ;;
-      --keep-logs) _UUA_KEEP_LOGS=1 ;;
-      --no-color)  _UUA_NO_COLOR=1 ;;
-      --verbose)   _UUA_VERBOSE=1 ;;
+      --check)      _UUA_CHECK_ONLY=1 ;;
+      --prune)      _UUA_PRUNE=1 ;;
+      --prune-only) _UUA_PRUNE_ONLY=1 ;;
+      --keep-logs)  _UUA_KEEP_LOGS=1 ;;
+      --no-color)   _UUA_NO_COLOR=1 ;;
+      --verbose)    _UUA_VERBOSE=1 ;;
       --apt)       _UUA_WANT_APT=1 _UUA_FILTERED=1 ;;
       --node)      _UUA_WANT_NODE=1 _UUA_FILTERED=1 ;;
       --rust)      _UUA_WANT_RUST=1 _UUA_FILTERED=1 ;;
@@ -3949,6 +4215,18 @@ main() {
 
     shift
   done
+
+  # "Also prune" and "only prune" contradict each other; the removals
+  # are the same either way.
+  if (( _UUA_PRUNE && _UUA_PRUNE_ONLY )); then
+    print -r -- "--prune and --prune-only cannot be combined: --prune-only already removes everything --prune would" >&2
+    print -r -- 'Run "uua --help" for usage.' >&2
+    return 2
+  fi
+
+  # The removals a prune-only run makes are the ones --prune adds to
+  # an updating run.
+  (( _UUA_PRUNE_ONLY )) && _UUA_PRUNE=1
 
   _init_colors
 
@@ -4005,6 +4283,13 @@ main() {
   _group_enabled _UUA_WANT_RUST && _load_rustup
 
   _plan_build
+
+  # A prune-only run whose groups have nothing to prune (only --rust,
+  # say) would show an empty board; say so instead.
+  if (( _UUA_PRUNE_ONLY && $#_UUA_PLAN == 0 )); then
+    _info "Nothing to prune for the selected groups (Rust toolchains are never removed)"
+  fi
+
   _prefetch_all
 
   # The sudo password comes before the board, while no redraw can hide

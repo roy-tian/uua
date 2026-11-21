@@ -479,7 +479,7 @@ expect "rustup: names apart from markers" \
 
 job_run() {
   _UUA_UPTODATE=0 _UUA_UPDATED=0 _UUA_AVAILABLE=0 _UUA_FAILED_STEPS=0
-  "$1"
+  "$@"
   print -r -- "counts:$_UUA_UPTODATE $_UUA_UPDATED $_UUA_AVAILABLE $_UUA_FAILED_STEPS"
 }
 
@@ -632,13 +632,166 @@ cp "$(command -v sleep)" "$releases/r1/bin/sleep"
 busy=$!
 sleep 0.2
 
+expect "codex: count skips the in-use release" 1 "$(_codex_prune count)"
+
 expect "codex: releases in use kept" 1 "$(_codex_prune remove)"
 expect "codex: what is left" "not-a-release r1 r3" "${(j: :)${(@f)$(ls "$releases")}}"
 
 kill "$busy" 2>/dev/null
 wait "$busy" 2>/dev/null
 
+expect "codex: count once the process is gone" 1 "$(_codex_prune count)"
+
 unset CODEX_HOME
+
+
+# ── Prune-only steps ───────────────────────────────────────
+
+# The Node prune step on its own: without a node job to leave the
+# list, it works the stale releases out itself and its outcome counts.
+prune_nvm="$TMP/prune-nvm"
+rm -rf -- "$prune_nvm"
+mkdir -p "$prune_nvm/alias" "$prune_nvm/versions/node"/{v18.0.0,v20.0.0,v22.0.0}
+print -r -- v22.0.0 >"$prune_nvm/alias/default"
+
+nvm() {
+  case "$1" in
+    version)
+      if [[ "$2" == default ]]; then
+        print -r -- "$(<"$NVM_DIR/alias/default")"
+      else
+        print v22.0.0
+      fi ;;
+    uninstall) rm -rf -- "$NVM_DIR/versions/node/v${2#v}" ;;
+  esac
+}
+
+node_prune_run() {
+  rm -f "$_UUA_RUN_DIR/node-stale"
+  NVM_DIR="$prune_nvm" job_run _step_node_prune
+}
+
+_UUA_PRUNE=1 _UUA_PRUNE_ONLY=1
+out="$(node_prune_run)"
+expect "node prune-only: stale releases removed" yes \
+  "$(has "$out" "↑ 2 old release(s) removed")"
+expect "node prune-only: counted" "counts:0 1 0 0" "${${(f)out}[-1]}"
+expect "node prune-only: what is left" "v22.0.0" "$(ls "$prune_nvm/versions/node")"
+
+# The default's release is kept even when it is not the LTS.
+mkdir -p "$prune_nvm/versions/node"/{v18.0.0,v20.0.0}
+print -r -- v20.0.0 >"$prune_nvm/alias/default"
+out="$(node_prune_run)"
+expect "node prune-only: the default's release kept" "v20.0.0 v22.0.0" \
+  "${(j: :)${(@f)$(ls "$prune_nvm/versions/node")}}"
+expect "node prune-only: one removed" yes "$(has "$out" "↑ 1 old release(s) removed")"
+
+mkdir -p "$prune_nvm/versions/node/v18.0.0"
+_UUA_CHECK_ONLY=1
+out="$(node_prune_run)"
+expect "node prune-only check: reported" yes \
+  "$(has "$out" "↑ 1 old release(s): 18.0.0")"
+expect "node prune-only check: counted" "counts:0 0 1 0" "${${(f)out}[-1]}"
+expect "node prune-only check: nothing removed" "v18.0.0 v20.0.0 v22.0.0" \
+  "${(j: :)${(@f)$(ls "$prune_nvm/versions/node")}}"
+_UUA_CHECK_ONLY=0
+
+unfunction nvm
+unset NVM_DIR
+
+# The APT prune step: unused packages go, nothing else.
+stub sudo '[ "$1" = -n ] && shift; [ "$1" = true ] && exit 0; exec "$@"'
+stub apt-get "case \" \$* \" in
+  *' -s autoremove '*) echo 'Remv old-a'; echo 'Remv old-b' ;;
+  *' autoremove '*) echo done >$TMP/apt-autoremoved ;;
+esac"
+
+out="$(job_run _step_apt_prune)"
+expect "apt prune-only: removed" yes "$(has "$out" "↑ 2 unused package(s) removed")"
+expect "apt prune-only: counted" "counts:0 1 0 0" "${${(f)out}[-1]}"
+expect "apt prune-only: autoremove ran" yes \
+  "$( [[ -e "$TMP/apt-autoremoved" ]] && print yes || print no)"
+
+_UUA_CHECK_ONLY=1
+rm -f "$TMP/apt-autoremoved"
+out="$(job_run _step_apt_prune)"
+expect "apt prune-only check: reported" yes \
+  "$(has "$out" "↑ 2 package(s) no longer needed")"
+expect "apt prune-only check: counted" "counts:0 0 1 0" "${${(f)out}[-1]}"
+expect "apt prune-only check: nothing removed" no \
+  "$( [[ -e "$TMP/apt-autoremoved" ]] && print yes || print no)"
+_UUA_CHECK_ONLY=0
+
+rm -f "$TMP/bin/apt-get" "$TMP/bin/sudo"
+
+# The Codex prune job: old standalone releases go without an update.
+export CODEX_HOME="$TMP/codex-prune"
+releases="$CODEX_HOME/packages/standalone/releases"
+rm -rf -- "$CODEX_HOME"
+for r in cur old1 old2; do
+  mkdir -p "$releases/$r"
+  touch "$releases/$r/codex-package.json"
+done
+ln -s "$releases/cur" "$CODEX_HOME/packages/standalone/current"
+stub codex 'echo "codex-cli 0.50.0"'
+
+out="$(job_run _job_ai_prune codex)"
+expect "codex prune job: removed" yes "$(has "$out" "↑ 2 old release(s) removed")"
+expect "codex prune job: counted" "counts:0 1 0 0" "${${(f)out}[-1]}"
+expect "codex prune job: current kept" "cur" "$(ls "$releases")"
+
+mkdir -p "$releases/again"
+touch "$releases/again/codex-package.json"
+_UUA_CHECK_ONLY=1
+out="$(job_run _job_ai_prune codex)"
+expect "codex prune job: check reports" yes "$(has "$out" "↑ 1 old release(s)")"
+expect "codex prune job: check counted" "counts:0 0 1 0" "${${(f)out}[-1]}"
+expect "codex prune job: check keeps them" "again cur" \
+  "${(j: :)${(@f)$(ls "$releases")}}"
+_UUA_CHECK_ONLY=0
+
+# A release that cannot be deleted is a failure, not "in use; kept".
+mkdir -p "$releases/stuck"
+touch "$releases/stuck/codex-package.json"
+chmod 500 "$releases"
+out="$(job_run _job_ai_prune codex)"
+chmod 755 "$releases"
+expect "codex prune job: rm failure reported" yes \
+  "$(has "$out" "✗ unable to remove the old release(s)")"
+expect "codex prune job: failure counted" "counts:0 0 0 1" "${${(f)out}[-1]}"
+expect "codex prune job: the stuck release kept" "again cur stuck" \
+  "${(j: :)${(@f)$(ls "$releases")}}"
+
+# The plan under --prune-only: only removal jobs, only for the groups
+# that have any.
+prune_plan() {
+  _UUA_PLAN=() _UUA_J_NAME=() _UUA_J_GROUP=() _UUA_J_DEPS=() _UUA_J_FUNC=() _UUA_J_OWNER=()
+  _UUA_PRUNE_ONLY=1 _UUA_FILTERED=1
+  _UUA_WANT_APT="$1" _UUA_WANT_NODE="$2" _UUA_WANT_RUST="$3" _UUA_WANT_AI="$4"
+  _plan_build
+}
+
+prune_plan 1 0 0 0
+expect "plan: prune-only apt" "_step_apt_prune" "$_UUA_J_FUNC[apt]"
+expect "plan: prune-only apt alone" 1 "$#_UUA_PLAN"
+
+prune_plan 0 1 0 0
+expect "plan: prune-only node" "_step_node_prune" "$_UUA_J_FUNC[prune]"
+expect "plan: prune-only node alone" 1 "$#_UUA_PLAN"
+
+prune_plan 0 0 1 0
+expect "plan: prune-only rust has nothing" 0 "$#_UUA_PLAN"
+
+prune_plan 0 0 0 1
+expect "plan: prune-only ai" "ai-codex _job_ai_prune codex" "$_UUA_PLAN[1] ${_UUA_J_FUNC[ai-codex]}"
+expect "plan: prune-only ai just codex" 1 "$#_UUA_PLAN"
+
+_UUA_PRUNE_ONLY=0 _UUA_FILTERED=0
+_UUA_WANT_APT=0 _UUA_WANT_NODE=0 _UUA_WANT_RUST=0 _UUA_WANT_AI=0
+_UUA_PRUNE=0
+
+rm -f "$TMP/bin/codex"
+unset CODEX_HOME releases
 
 
 # ── Processes ───────────────────────────────────────────────
@@ -992,6 +1145,14 @@ expect "cli: --verbose accepted" "UUA 0.1.8" "$(zsh "$ROOT/uua" --verbose --vers
 zsh "$ROOT/uua" --bogus 2>/dev/null
 expect "cli: unknown option" 2 $?
 
+zsh "$ROOT/uua" --prune --prune-only 2>/dev/null
+expect "cli: --prune with --prune-only refused" 2 $?
+
+out="$(zsh "$ROOT/uua" --prune-only --rust 2>/dev/null)"
+expect "cli: prune-only rust exits clean" 0 $?
+expect "cli: prune-only rust says so" yes \
+  "$(has "$out" "Nothing to prune for the selected groups")"
+
 stub claude 'echo "1.0.0 (Claude Code)"'
 stub curl 'printf 2.0.0'
 
@@ -1131,6 +1292,44 @@ expect "run: rust after rustup"   yes "$(before rustup rust)"
 expect "run: prune last"          prune "$order[-1]"
 expect "run: jobs overlapped" yes \
   "$([[ "$out" =~ '([0-9.]+)× in parallel' ]] && (( match[1] > 1.5 )) && print yes)"
+
+# --prune-only against the fake system, seeded with an old Node
+# release and stale Codex releases: they and the unused APT packages
+# go, and nothing is updated. The seeding goes in after fake_build:
+# fake_run would rebuild the system and wipe it out again.
+prune_fixture() {
+  fake_build "$F"
+  cp -a "$F/home/.nvm/versions/node/v22.0.0" "$F/home/.nvm/versions/node/v18.0.0"
+  codexrel="$F/home/.codex/packages/standalone/releases"
+  mkdir -p "$codexrel"/{cur,old1,old2}
+  touch "$codexrel"/{cur,old1,old2}/codex-package.json
+  ln -s "$codexrel/cur" "$F/home/.codex/packages/standalone/current"
+}
+
+prune_fixture
+out="$(env -i $fake_env FAKE_SPEED=0.1 zsh "$ROOT/uua" --prune-only)"
+expect "prune-only: succeeds" 0 $?
+expect "prune-only: three jobs" "UUA · 3 jobs" "${${(f)out}[1]}"
+expect "prune-only: the old Node release removed" "v22.0.0" \
+  "$(ls "$F/home/.nvm/versions/node")"
+expect "prune-only: the stale Codex releases removed" "cur" "$(ls "$codexrel")"
+expect "prune-only: the unused APT packages removed" 0 "$(<"$F/db/apt-unused")"
+expect "prune-only: nothing updated" "12 2.0.0 1.28.0" \
+  "$(<"$F/db/apt-pending") $(<"$F/db/claude") $(<"$F/db/rustup")"
+
+# --check --prune-only: reports the removals, removes nothing.
+prune_fixture
+out="$(env -i $fake_env FAKE_SPEED=0.1 zsh "$ROOT/uua" --check --prune-only)"
+expect "prune-only check: exits 100" 100 $?
+expect "prune-only check: the Node release reported" yes \
+  "$(has "$out" "1 old release(s): 18.0.0")"
+expect "prune-only check: the Codex releases reported" yes \
+  "$(has "$out" "2 old release(s)")"
+expect "prune-only check: the packages reported" yes \
+  "$(has "$out" "2 package(s) no longer needed")"
+expect "prune-only check: nothing removed" "v18.0.0 v22.0.0" \
+  "${(j: :)${(@f)$(ls "$F/home/.nvm/versions/node")}}"
+expect "prune-only check: apt untouched" 2 "$(<"$F/db/apt-unused")"
 
 # The Rust group against a fresh fake system, checked: everything is
 # reported and nothing installed.

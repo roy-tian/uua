@@ -46,6 +46,7 @@ make uninstall
 uua                 # update everything installed
 uua --check         # check for available updates without changing anything (no sudo)
 uua --prune         # also remove superseded versions and unused APT packages
+uua --prune-only    # only run that removal; nothing is updated (combine with group flags)
 uua --apt           # only APT packages
 uua --node          # only node, npm, bun, and global npm/bun packages
 uua --rust          # only rustup and Rust toolchains
@@ -57,7 +58,7 @@ uua --help          # full option and behavior reference
 ```
 
 - **Combine filters**: Group flags can be combined freely (e.g., `uua --apt --ai`).
-- **Safe cleanup (`--prune`)**: Nothing is removed unless `--prune` is passed. With `--prune`, UUA removes Node.js releases older than the current LTS (keeping `default` and any release used by a running process), older standalone Codex releases, and unused APT packages (`apt-get autoremove`). Rust toolchains are never removed.
+- **Safe cleanup (`--prune` / `--prune-only`)**: Nothing is removed unless `--prune` is passed. With `--prune`, UUA removes Node.js releases older than the current LTS (keeping `default` and any release used by a running process), older standalone Codex releases, and unused APT packages (`apt-get autoremove`). Rust toolchains are never removed. `uua --prune-only` runs just that cleanup with no updates around it; it takes the same group flags, and `--check --prune-only` reports what it would remove.
 - **Safe interruption (`Ctrl-C`)**: Cancels active jobs and pending APT downloads immediately; if `dpkg` is already running, UUA waits for it to finish safely.
 
 ### Exit Codes
@@ -67,7 +68,7 @@ uua --help          # full option and behavior reference
 | `0` | Everything is up to date or was updated |
 | `1` | A step failed, or another `uua` run is already active |
 | `2` | Invalid command-line option |
-| `100` | Updates are available (`--check`) |
+| `100` | Updates are available (`--check`); with `--prune-only`, things to remove |
 | `130` | Interrupted with `Ctrl-C` |
 
 ## Development
